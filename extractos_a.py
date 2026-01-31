@@ -5,113 +5,130 @@ import pandas as pd
 import re
 
 # =========================
-# OCR: ocrmypdf (PDF -> PDF editable)
+# CONFIG UI
 # =========================
-try:
-    import ocrmypdf
-    OCR_AVAILABLE = True
-except Exception:
-    OCR_AVAILABLE = False
+st.set_page_config(
+    page_title="ETLs de Extractos → Excel",
+    page_icon="📄",
+    layout="wide"
+)
+
+st.title("📄 ETLs de Extractos Bancarios → Excel")
+st.caption("Subí el TXT copiado desde un PDF con OCR (hecho fuera de esta app) y descargá el Excel listo para analizar.")
+
+# Sidebar (global)
+with st.sidebar:
+    st.header("🧰 Cómo usar")
+    st.markdown(
+        """
+1) Generá un PDF copiable con OCR (ej. Colab)  
+2) Abrí el PDF y copiá el bloque **Detalle de movimientos**  
+3) Pegalo en un `.txt`  
+4) Subí el `.txt` en el ETL correcto (tab correspondiente)  
+5) Descargá el Excel
+        """
+    )
+    st.divider()
+    st.markdown("**Sugerencia:** guardá el `.txt` en UTF-8 si podés (igual manejamos errores).")
 
 
 # =========================
-# ETL: TXT -> XLSX (tu código)
+# ETL #1: BANCO ACTUAL (TXT -> XLSX)
 # =========================
-date_re = re.compile(r"^\d{2}/\d{2}/\d{2}\b")
-pure_digits_re = re.compile(r"^\d+$")
+def etl_banco_actual_txt_to_excel_bytes(txt_bytes: bytes):
+    # ---------- Regex base ----------
+    date_re = re.compile(r"^\d{2}/\d{2}/\d{2}\b")
+    pure_digits_re = re.compile(r"^\d+$")
 
-HEADER_MARKERS = {
-    "DETALLE DE MOVIMIENTOS",
-    "Fecha Concepto",
-    "Fecha Concepto Débito Crédito Saldo",
-    "Débito Crédito Saldo",
-    "Debito Credito Saldo",
-}
+    HEADER_MARKERS = {
+        "DETALLE DE MOVIMIENTOS",
+        "Fecha Concepto",
+        "Fecha Concepto Débito Crédito Saldo",
+        "Débito Crédito Saldo",
+        "Debito Credito Saldo",
+    }
 
-def is_amount_token(tok: str) -> bool:
-    if pure_digits_re.match(tok):
+    def is_amount_token(tok: str) -> bool:
+        # referencias = solo dígitos => NO importe
+        if pure_digits_re.match(tok):
+            return False
+        return bool(re.fullmatch(r"-?[\d\.,]+", tok)) and ("," in tok or "." in tok or tok.startswith("-"))
+
+    def is_header(line: str) -> bool:
+        up = line.upper()
+        if line in HEADER_MARKERS:
+            return True
+        if up.startswith(("I.V.A.", "RESUMEN DE CUENTA", "CUENTA CORRIENTE", "C.U.I.T.")) or "C.U.I.T." in up:
+            return True
         return False
-    return bool(re.fullmatch(r"-?[\d\.,]+", tok)) and ("," in tok or "." in tok or tok.startswith("-"))
 
-def is_header(line: str) -> bool:
-    up = line.upper()
-    if line in HEADER_MARKERS:
-        return True
-    if up.startswith(("I.V.A.", "RESUMEN DE CUENTA", "CUENTA CORRIENTE", "C.U.I.T.")) or "C.U.I.T." in up:
-        return True
-    return False
+    def normalize_amount(s: str):
+        s = s.strip().replace(" ", "")
+        s = (s.replace("DВ", "DB").replace("Dв", "DB")
+               .replace("АРБА", "ARBA").replace("АРBА", "ARBA")
+               .replace("CАРTAIN", "CAPTAIN"))
+        s = re.sub(r"[^0-9\-,\.]", "", s)
+        if s in {"", "-", ".", ",", "-.", "-,"}:
+            return None
 
-def normalize_amount(s: str):
-    s = s.strip().replace(" ", "")
-    s = (s.replace("DВ", "DB").replace("Dв", "DB")
-           .replace("АРБА", "ARBA").replace("АРBА", "ARBA")
-           .replace("CАРTAIN", "CAPTAIN"))
-    s = re.sub(r"[^0-9\-,\.]", "", s)
-    if s in {"", "-", ".", ",", "-.", "-,"}:
-        return None
+        neg = s.startswith("-")
+        s2 = s[1:] if neg else s
 
-    neg = s.startswith("-")
-    s2 = s[1:] if neg else s
-
-    if "." in s2 and "," in s2:
-        last_dot = s2.rfind(".")
-        last_com = s2.rfind(",")
-        dec = "." if last_dot > last_com else ","
-        thou = "," if dec == "." else "."
-        s2 = s2.replace(thou, "")
-        if dec == ",":
-            s2 = s2.replace(",", ".")
-    else:
-        if "," in s2:
-            parts = s2.split(",")
-            if len(parts[-1]) == 2:
-                s2 = "".join(parts[:-1]) + "." + parts[-1]
-            else:
-                s2 = s2.replace(",", "")
-        elif "." in s2:
-            parts = s2.split(".")
-            if len(parts[-1]) == 2:
-                s2 = "".join(parts[:-1]) + "." + parts[-1]
-            else:
-                if len(parts) >= 3 and len(parts[-1]) == 2:
+        if "." in s2 and "," in s2:
+            last_dot = s2.rfind(".")
+            last_com = s2.rfind(",")
+            dec = "." if last_dot > last_com else ","
+            thou = "," if dec == "." else "."
+            s2 = s2.replace(thou, "")
+            if dec == ",":
+                s2 = s2.replace(",", ".")
+        else:
+            if "," in s2:
+                parts = s2.split(",")
+                if len(parts[-1]) == 2:
                     s2 = "".join(parts[:-1]) + "." + parts[-1]
                 else:
-                    s2 = s2.replace(".", "")
+                    s2 = s2.replace(",", "")
+            elif "." in s2:
+                parts = s2.split(".")
+                if len(parts[-1]) == 2:
+                    s2 = "".join(parts[:-1]) + "." + parts[-1]
+                else:
+                    if len(parts) >= 3 and len(parts[-1]) == 2:
+                        s2 = "".join(parts[:-1]) + "." + parts[-1]
+                    else:
+                        s2 = s2.replace(".", "")
 
-    try:
-        val = float(s2)
-        return -val if neg else val
-    except Exception:
-        return None
+        try:
+            val = float(s2)
+            return -val if neg else val
+        except Exception:
+            return None
 
-def extract_tail_amounts(tokens):
-    rest = tokens[:]
-    amts = []
-    while rest and is_amount_token(rest[-1]):
-        amts.append(rest.pop())
-    amts.reverse()
-    return rest, amts
+    def extract_tail_amounts(tokens):
+        rest = tokens[:]
+        amts = []
+        while rest and is_amount_token(rest[-1]):
+            amts.append(rest.pop())
+        amts.reverse()
+        return rest, amts
 
-def fallback_side(concept: str) -> str:
-    c = (concept or "").lower()
-    if "/cr" in c or "credito" in c or "comercios first data" in c:
+    def fallback_side(concept: str) -> str:
+        c = (concept or "").lower()
+        if "/cr" in c or "credito" in c or "comercios first data" in c:
+            return "credito"
+        if "/db" in c or "debito" in c:
+            return "debito"
+        if any(k in c for k in ["comision", "impuesto", "retención", "retencion", "percepción", "percepcion", "iva", "pago"]):
+            return "debito"
         return "credito"
-    if "/db" in c or "debito" in c:
-        return "debito"
-    if any(k in c for k in ["comision", "impuesto", "retención", "retencion", "percepción", "percepcion", "iva", "pago"]):
-        return "debito"
-    return "credito"
 
-def txt_to_excel_bytes(txt_bytes: bytes, filename_out: str = "Extracto_ETL.xlsx"):
-    """
-    Toma el TXT (bytes), arma el DF y devuelve (excel_bytes, mov_final_df, raw_df).
-    """
     text = txt_bytes.decode("utf-8", errors="ignore")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
     rows = []
     pending_detail = []
-    pending_saldo_indices = []
+    pending_saldo_indices = []   # FIFO de movimientos sin saldo todavía
     opening_saldo = None
     last_movement_idx = None
 
@@ -130,9 +147,11 @@ def txt_to_excel_bytes(txt_bytes: bytes, filename_out: str = "Extracto_ETL.xlsx"
 
         up = ln.upper()
 
+        # números de página
         if re.fullmatch(r"\d{1,4}", ln):
             continue
 
+        # SUBTOTAL (primero = saldo inicial)
         if up.startswith("SUBTOTAL"):
             nums = re.findall(r"-?[\d\.,]+", ln)
             st = normalize_amount(nums[-1]) if nums else None
@@ -152,6 +171,7 @@ def txt_to_excel_bytes(txt_bytes: bytes, filename_out: str = "Extracto_ETL.xlsx"
                 opening_saldo = st
             continue
 
+        # detalles (debug)
         if up.startswith((
             "OPERACIÓN", "OPERACION",
             "NRO COMERCIO", "NRO COMERCIO:",
@@ -162,6 +182,7 @@ def txt_to_excel_bytes(txt_bytes: bytes, filename_out: str = "Extracto_ETL.xlsx"
             pending_detail.append(ln)
             continue
 
+        # saldo suelto
         if re.fullmatch(r"-?[\d\.,]+", ln) and not date_re.match(ln) and ("," in ln or "." in ln or ln.startswith("-")):
             val = normalize_amount(ln)
             if val is not None and pending_saldo_indices:
@@ -172,6 +193,7 @@ def txt_to_excel_bytes(txt_bytes: bytes, filename_out: str = "Extracto_ETL.xlsx"
                 pending_detail.append(ln)
             continue
 
+        # movimiento con fecha
         if date_re.match(ln):
             attach_detail(last_movement_idx)
 
@@ -230,6 +252,7 @@ def txt_to_excel_bytes(txt_bytes: bytes, filename_out: str = "Extracto_ETL.xlsx"
     for c in ["Importe_Parsed", "Saldo"]:
         mov[c] = pd.to_numeric(mov[c], errors="coerce")
 
+    # Debito/Credito por delta de saldo
     tol = 0.05
     prev_saldo = opening_saldo
 
@@ -263,10 +286,9 @@ def txt_to_excel_bytes(txt_bytes: bytes, filename_out: str = "Extracto_ETL.xlsx"
 
         prev_saldo = saldo
 
-    # Final: eliminar columnas internas
     mov_final = mov.drop(columns=["Tipo", "Importe_Parsed", "Referencia", "Detalle"], errors="ignore")
 
-    # Exportar a bytes
+    # Excel bytes
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp_path = Path(tmp.name)
 
@@ -281,120 +303,30 @@ def txt_to_excel_bytes(txt_bytes: bytes, filename_out: str = "Extracto_ETL.xlsx"
 
 
 # =========================
-# UI Streamlit
+# “Framework” para futuros ETLs
 # =========================
-st.set_page_config(
-    page_title="Extractor de Extractos (PDF/TXT → Excel)",
-    page_icon="📄",
-    layout="wide"
-)
+def tab_banco_actual():
+    st.subheader("🏦 Banco X (TXT → Excel)")
+    st.write("Subí el `.txt` con el texto pegado desde el PDF con OCR y descargá el Excel.")
 
-st.title("📄 Extractos: PDF (OCR) + TXT → Excel")
-st.caption("Flujo pensado para extractos escaneados: primero generás un PDF con capa de texto, después pegás el texto en un .txt y obtenés el Excel.")
+    st.info(
+        "Tip: Pegá todo el bloque **Detalle de movimientos**. "
+        "Si el saldo aparece en líneas separadas, el parser lo reasigna en orden."
+    )
 
-with st.sidebar:
-    st.header("⚙️ Ajustes")
-    st.write("Estos ajustes aplican al OCR (PDF → PDF editable).")
-    lang = st.selectbox("Idioma OCR", ["spa", "spa+eng", "eng"], index=0)
-    deskew = st.toggle("Corregir inclinación (deskew)", value=True)
-    force_ocr = st.toggle("Forzar OCR (aunque detecte texto)", value=True)
-    st.divider()
-    st.markdown("**Tips rápidos**")
-    st.markdown("- Si el PDF ya trae algo de texto raro, usá **Forzar OCR**.")
-    st.markdown("- Si el escaneo está torcido, activá **deskew**.")
-    st.markdown("- Para extractos con mezcla ES/EN, probá **spa+eng**.")
+    txt_file = st.file_uploader("📎 Cargar TXT", type=["txt"], key="txt_banco_actual")
 
-tab1, tab2 = st.tabs(["1) PDF → PDF editable (OCR)", "2) TXT → Excel"])
+    col1, col2 = st.columns([1, 1], gap="large")
 
-# ---------- TAB 1 ----------
-with tab1:
-    st.subheader("1) Subí un PDF y obtené un PDF con capa OCR (copiable)")
-    colA, colB = st.columns([1, 1], gap="large")
-
-    with colA:
-        pdf_file = st.file_uploader("📎 Cargar PDF", type=["pdf"], key="pdf_uploader")
-        st.info(
-            "Esto genera un PDF **copiable** (texto por encima). "
-            "Ideal para que el usuario luego copie/pegue en TXT."
-        )
-
-        if not OCR_AVAILABLE:
-            st.error("No está disponible `ocrmypdf` en este entorno. Instalalo con: `pip install ocrmypdf`.")
-        else:
-            if pdf_file is not None:
-                if st.button("🚀 Generar PDF editable", type="primary"):
-                    with st.spinner("Procesando OCR..."):
-                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f_in:
-                            f_in.write(pdf_file.read())
-                            in_path = Path(f_in.name)
-
-                        out_path = in_path.with_name(in_path.stem + "_editable.pdf")
-
-                        try:
-                            ocrmypdf.ocr(
-                                in_path,
-                                out_path,
-                                language=lang,
-                                deskew=deskew,
-                                force_ocr=force_ocr
-                            )
-
-                            out_bytes = out_path.read_bytes()
-
-                            st.success("✅ Listo. Descargá el PDF editable:")
-                            st.download_button(
-                                "⬇️ Descargar PDF editable",
-                                data=out_bytes,
-                                file_name="Extracto_Editable.pdf",
-                                mime="application/pdf"
-                            )
-
-                        except Exception as e:
-                            st.exception(e)
-                        finally:
-                            in_path.unlink(missing_ok=True)
-                            out_path.unlink(missing_ok=True)
-
-    with colB:
-        st.markdown("### 🧭 Guía de uso")
-        st.markdown(
-            """
-**Paso 1:** Subí el PDF escaneado  
-**Paso 2:** Descargá el PDF editable  
-**Paso 3:** Abrilo y **copiá** la tabla del extracto  
-**Paso 4:** Pegalo en un `.txt` (sin formateo)  
-**Paso 5:** Andá al Tab 2 y generá el Excel
-            """
-        )
-        st.markdown("### ✅ Recomendaciones")
-        st.markdown(
-            """
-- Copiá/pegá *todo el bloque* “Detalle de movimientos”.
-- Si se pegan líneas vacías, no pasa nada (se limpian).
-- Si hay caracteres raros (OCR), igual suele funcionar: el parser normaliza importes y detecta saldos sueltos.
-            """
-        )
-
-# ---------- TAB 2 ----------
-with tab2:
-    st.subheader("2) Subí el TXT y obtené el Excel")
-    colC, colD = st.columns([1, 1], gap="large")
-
-    with colC:
-        txt_file = st.file_uploader("📎 Cargar TXT (texto pegado desde el PDF)", type=["txt"], key="txt_uploader")
-
-        st.warning(
-            "Asegurate de que el TXT tenga la estructura tipo extracto: "
-            "líneas con fecha + concepto, y saldos sueltos debajo cuando corresponda."
-        )
-
+    with col1:
         if txt_file is not None:
-            if st.button("🧩 Generar Excel", type="primary"):
-                with st.spinner("Armando Excel..."):
+            if st.button("🧩 Generar Excel", type="primary", key="btn_banco_actual"):
+                with st.spinner("Procesando TXT y armando Excel..."):
                     try:
-                        excel_bytes, mov_final, raw_df = txt_to_excel_bytes(txt_file.read())
-                        st.success("✅ Excel generado correctamente.")
+                        excel_bytes, mov_final, raw_df = etl_banco_actual_txt_to_excel_bytes(txt_file.read())
+                        st.session_state["preview_df"] = mov_final
 
+                        st.success("✅ Listo.")
                         st.download_button(
                             "⬇️ Descargar Excel",
                             data=excel_bytes,
@@ -402,28 +334,48 @@ with tab2:
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
 
-                        st.caption("Se exporta: Movimientos (final) + Raw_Parse (debug).")
+                        with st.expander("Ver debug (Raw_Parse)"):
+                            st.dataframe(raw_df, use_container_width=True)
 
                     except Exception as e:
                         st.exception(e)
+        else:
+            st.warning("Esperando un archivo TXT...")
 
-    with colD:
-        st.markdown("### 👀 Vista previa (si generaste el Excel)")
-        if "mov_final" not in st.session_state:
-            st.session_state["mov_final"] = None
+    with col2:
+        st.markdown("### 👀 Vista previa")
+        preview_df = st.session_state.get("preview_df", None)
+        if preview_df is None:
+            st.caption("Cuando generes el Excel, acá vas a ver las primeras filas.")
+        else:
+            st.dataframe(preview_df.head(30), use_container_width=True)
 
-        # Truco: mostrar preview si el user ya generó
-        # (Streamlit re-renderiza; guardamos en session_state si se quiere persistencia)
-        # Para simplicidad, si querés persistencia total, lo guardamos cuando genera.
-        st.info("Cuando generes el Excel, acá podés ver una muestra de las primeras filas.")
-        # Intentar reconstruir preview si ya lo generamos en este render:
-        if txt_file is not None:
-            # no recalculamos sin click; solo mostramos si existe en memoria
-            pass
+def tab_placeholder(nombre: str):
+    st.subheader(f"🧩 {nombre} (próximamente)")
+    st.write(
+        "Este tab está preparado para sumar un ETL nuevo en el futuro. "
+        "La idea es que cada banco/estructura tenga su propio parser."
+    )
+    st.info("Cuando quieras sumar otro, se agrega una función `etl_xxx()` y se conecta acá.")
 
-        # Mostrar preview si quedó guardado
-        # (si querés persistencia real, en el bloque de "Generar Excel" guardá mov_final a session_state)
-        st.markdown("**Tip:** si querés preview persistente, guardá `mov_final` en `st.session_state` cuando generás.")
+
+# =========================
+# Tabs
+# =========================
+tabs = st.tabs([
+    "🏦 Banco X (actual)",
+    "➕ Otro ETL (placeholder)",
+    "➕ Otro ETL (placeholder 2)"
+])
+
+with tabs[0]:
+    tab_banco_actual()
+
+with tabs[1]:
+    tab_placeholder("Banco Y")
+
+with tabs[2]:
+    tab_placeholder("Banco Z")
 
 st.divider()
-st.caption("Hecho para tu flujo: PDF escaneado → PDF copiable → TXT → Excel. Si querés, agrego validación de saldos (OK/ERROR) y resaltado de filas inconsistentes.")
+st.caption("App preparada para múltiples ETLs: cada tab puede tener su propio parser y validaciones.")
