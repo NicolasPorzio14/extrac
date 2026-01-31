@@ -22,7 +22,7 @@ with st.sidebar:
     st.markdown(
         """
 1) Generá un PDF copiable con OCR (ej. Colab)  
-2) Abrí el PDF y copiá el bloque **Detalle de movimientos**  
+2) Abrí el PDF y copia el contenido  
 3) Pegalo en un `.txt`  
 4) Subí el `.txt` en el ETL correcto (tab correspondiente)  
 5) Descargá el Excel
@@ -379,3 +379,4 @@ with tabs[2]:
 
 st.divider()
 st.caption("App preparada para múltiples ETLs: cada tab puede tener su propio parser y validaciones.")
+
