@@ -42,8 +42,10 @@ def etl_banco_actual_txt_to_excel_bytes(txt_bytes: bytes):
     import pandas as pd
     import numpy as np
 
+    # =========================
+    # Regex / helpers
+    # =========================
     date_re = re.compile(r"^\d{2}/\d{2}/\d{2}\b")
-    pure_digits_re = re.compile(r"^\d+$")
 
     HEADER_MARKERS = {
         "DETALLE DE MOVIMIENTOS",
@@ -51,27 +53,40 @@ def etl_banco_actual_txt_to_excel_bytes(txt_bytes: bytes):
         "Fecha Concepto Débito Crédito Saldo",
         "Débito Crédito Saldo",
         "Debito Credito Saldo",
+        "Fecha Concepto Débito Crédito",
     }
 
-    def is_amount_token(tok: str) -> bool:
-        if pure_digits_re.match(tok):
-            return False
-        tok = tok.strip()
-        return bool(re.fullmatch(r"-?[\d\.,]+", tok)) and any(ch in tok for ch in [",", "."])
-
     def is_header(line: str) -> bool:
-        up = line.upper()
-        if line in HEADER_MARKERS:
+        up = line.upper().strip()
+        if up in {h.upper() for h in HEADER_MARKERS}:
             return True
         if up.startswith(("I.V.A.", "RESUMEN DE CUENTA", "CUENTA CORRIENTE", "C.U.I.T.")) or "C.U.I.T." in up:
             return True
         return False
 
+    # Token de importe "real": tiene separadores y termina en 2 decimales (coma o punto)
+    # Ej: 1.234,56 | 1234,56 | -12.345,67 | 12,34 | 12.34
+    amount_token_re = re.compile(r"^-?\d{1,3}([.,]\d{3})*([.,]\d{2})$|^-?\d+([.,]\d{2})$")
+
+    def is_amount_token(tok: str) -> bool:
+        tok = tok.strip()
+        return bool(amount_token_re.fullmatch(tok))
+
     def normalize_amount(s: str):
+        """
+        Convierte string con formato AR/ES a float:
+        1.234,56 -> 1234.56
+        1234,56  -> 1234.56
+        1,234.56 -> 1234.56 (si apareciera)
+        """
+        if s is None:
+            return None
         s = s.strip().replace(" ", "")
-        s = (s.replace("DВ", "DB").replace("Dв", "DB")
-               .replace("АРБА", "ARBA").replace("АРBА", "ARBA")
-               .replace("CАРTAIN", "CAPTAIN"))
+        if not s:
+            return None
+
+        # Limpieza OCR típica
+        s = s.replace("O", "0").replace("o", "0")
         s = re.sub(r"[^0-9\-,\.]", "", s)
         if s in {"", "-", ".", ",", "-.", "-,"}:
             return None
@@ -79,6 +94,7 @@ def etl_banco_actual_txt_to_excel_bytes(txt_bytes: bytes):
         neg = s.startswith("-")
         s2 = s[1:] if neg else s
 
+        # Caso con ambos separadores: decide decimal por el último separador
         if "." in s2 and "," in s2:
             last_dot = s2.rfind(".")
             last_com = s2.rfind(",")
@@ -88,47 +104,76 @@ def etl_banco_actual_txt_to_excel_bytes(txt_bytes: bytes):
             if dec == ",":
                 s2 = s2.replace(",", ".")
         else:
+            # Solo coma -> decimal si termina en 2 dígitos
             if "," in s2:
                 parts = s2.split(",")
                 if len(parts[-1]) == 2:
                     s2 = "".join(parts[:-1]) + "." + parts[-1]
                 else:
                     s2 = s2.replace(",", "")
+            # Solo punto -> decimal si termina en 2 dígitos
             elif "." in s2:
                 parts = s2.split(".")
                 if len(parts[-1]) == 2:
                     s2 = "".join(parts[:-1]) + "." + parts[-1]
                 else:
-                    if len(parts) >= 3 and len(parts[-1]) == 2:
-                        s2 = "".join(parts[:-1]) + "." + parts[-1]
-                    else:
-                        s2 = s2.replace(".", "")
+                    s2 = s2.replace(".", "")
 
         try:
-            val = float(s2)
-            return -val if neg else val
-        except Exception:
+            v = float(s2)
+            return -v if neg else v
+        except:
             return None
 
+    def join_split_decimals(tokens):
+        """
+        Une tokens que OCR partió:
+        "93,416." "95" => "93,416.95"
+        "93,416" ".95" => "93,416.95"
+        """
+        out = []
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if i + 1 < len(tokens):
+                n = tokens[i + 1]
+                if re.fullmatch(r"-?[\d\.,]+[.,]$", t) and re.fullmatch(r"\d{2}$", n):
+                    out.append(t + n)
+                    i += 2
+                    continue
+                if re.fullmatch(r"-?[\d\.,]+$", t) and re.fullmatch(r"[.,]\d{2}$", n):
+                    out.append(t + n)
+                    i += 2
+                    continue
+            out.append(t)
+            i += 1
+        return out
+
     def extract_tail_amounts(tokens):
-        rest = tokens[:]
+        toks = join_split_decimals(tokens)
+        rest = toks[:]
         amts = []
         while rest and is_amount_token(rest[-1]):
             amts.append(rest.pop())
         amts.reverse()
         return rest, amts
 
+    # =========================
+    # Parse TXT
+    # =========================
     text = txt_bytes.decode("utf-8", errors="ignore")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
     rows = []
     pending_detail = []
-    pending_indices = []  # movimientos que aún requieren (importe y/o saldo)
-    opening_saldo = None
     last_movement_idx = None
 
-    last_subtotal_saldo = None
-    page_boundary_active = False  # se activa con SUBTOTAL real o "DETALLE DE MOVIMIENTOS"
+    # Para asociar saldos “en línea siguiente”
+    expecting_saldo_for_last = False
+
+    # Apertura / subtotales como checkpoints
+    opening_saldo = None
+    subtotals = []
 
     def attach_detail(idx):
         nonlocal pending_detail
@@ -139,135 +184,80 @@ def etl_banco_actual_txt_to_excel_bytes(txt_bytes: bytes):
         rows[idx]["Detalle"] = (prev + ("\n" if prev else "") + add).strip()
         pending_detail.clear()
 
-    for ln in lines:
-        if is_header(ln):
-            if ln == "DETALLE DE MOVIMIENTOS":
-                page_boundary_active = True
-            continue
-
+    for i, ln in enumerate(lines):
         up = ln.upper()
 
-        # números de página (pero ojo: si fuera "13 93,416.95" no entra acá por el espacio)
+        if is_header(ln):
+            continue
+
+        # Página (número solo)
         if re.fullmatch(r"\d{1,4}", ln):
             continue
 
-        # SUBTOTAL: solo si realmente tiene número (si dice solo "SUBTOTAL", es un artefacto del encabezado)
-        if up.startswith("SUBTOTAL"):
-            if re.search(r"\d", ln):
-                nums = re.findall(r"-?[\d\.,]+", ln)
-                st = normalize_amount(nums[-1]) if nums else None
-                rows.append({
-                    "Tipo": "SUBTOTAL",
-                    "Fecha": None,
-                    "Concepto": "SUBTOTAL",
-                    "Referencia": None,
-                    "Importe_Parsed": None,
-                    "Debito": None,
-                    "Credito": None,
-                    "Saldo": st,
-                    "Detalle": None
-                })
-                last_movement_idx = None
-                if opening_saldo is None and st is not None:
+        # SUBTOTAL con número real
+        if up.startswith("SUBTOTAL") and re.search(r"\d", ln):
+            nums = re.findall(r"-?[\d\.,]+", ln)
+            st = normalize_amount(nums[-1]) if nums else None
+            rows.append({
+                "Tipo": "SUBTOTAL",
+                "Fecha": None,
+                "Concepto": "SUBTOTAL",
+                "Referencia": None,
+                "Importe_Parsed": None,
+                "Saldo": st,
+                "Detalle": None
+            })
+            if st is not None:
+                subtotals.append(st)
+                if opening_saldo is None:
                     opening_saldo = st
-                last_subtotal_saldo = st
-                page_boundary_active = True
+            last_movement_idx = None
             continue
 
-        # líneas “detalle” típicas
-        if up.startswith((
-            "OPERACIÓN", "OPERACION",
-            "NRO COMERCIO", "NRO COMERCIO:",
-            "CAPTAIN", "PYME",
-            "IDENTIFICACION:", "IDENTIFICACIÓN:"
-        )):
+        # “Saldo” como marcador: el número de la próxima línea es saldo del último movimiento
+        if up == "SALDO":
+            expecting_saldo_for_last = True
+            continue
+
+        # Detalles típicos
+        if up.startswith(("OPERACIÓN", "OPERACION", "NRO COMERCIO", "CAPTAIN", "PYME", "IDENTIFICACION", "IDENTIFICACIÓN")):
             pending_detail.append(ln)
             continue
 
-        # ===== 1) LÍNEAS SIN FECHA CON IMPORTES AL FINAL (page breaks) =====
-        if pending_indices and not date_re.match(ln):
-            toks = ln.split()
-            # tomo la “cola” de tokens numéricos (al final)
-            tail = []
-            j = len(toks) - 1
-            while j >= 0 and is_amount_token(toks[j]):
-                tail.append(toks[j])
-                j -= 1
-            tail = list(reversed(tail))
-
-            if len(tail) >= 2:
-                saldo_val = normalize_amount(tail[-1])
-
-                # Caso A: [importe, saldo]
-                if len(tail) == 2:
-                    amt_val = normalize_amount(tail[0])
-                    if amt_val is not None and saldo_val is not None:
-                        idx = pending_indices.pop(0)
-                        attach_detail(idx)
-                        if rows[idx].get("Importe_Parsed") is None:
-                            rows[idx]["Importe_Parsed"] = amt_val
-                        rows[idx]["Saldo"] = saldo_val
-                        page_boundary_active = False
-                        continue
-
-                # Caso B: [debito, credito, saldo]
-                if len(tail) == 3:
-                    d = normalize_amount(tail[0])
-                    c = normalize_amount(tail[1])
-                    if saldo_val is not None and (d is not None or c is not None):
-                        idx = pending_indices.pop(0)
-                        attach_detail(idx)
-                        rows[idx]["Saldo"] = saldo_val
-                        # si viene bien definido, guardo débito/crédito directo
-                        if d not in (None, 0.0) and (c in (None, 0.0)):
-                            rows[idx]["Debito"] = abs(d)
-                            rows[idx]["Credito"] = None
-                            if rows[idx].get("Importe_Parsed") is None:
-                                rows[idx]["Importe_Parsed"] = abs(d)
-                        elif c not in (None, 0.0) and (d in (None, 0.0)):
-                            rows[idx]["Credito"] = abs(c)
-                            rows[idx]["Debito"] = None
-                            if rows[idx].get("Importe_Parsed") is None:
-                                rows[idx]["Importe_Parsed"] = abs(c)
-                        page_boundary_active = False
-                        continue
-
-        # ===== 2) SALDO SUELTO (1 número) =====
-        if re.fullmatch(r"-?[\d\.,]+", ln) and not date_re.match(ln) and any(ch in ln for ch in [",", "."]):
+        # Línea NUMÉRICA sola
+        if re.fullmatch(r"-?[\d\.,]+", ln) and any(ch in ln for ch in [",", "."]):
             val = normalize_amount(ln)
-            if val is not None and pending_indices:
-                idx0 = pending_indices[0]
 
-                # si es saldo repetido del último subtotal (page break), lo ignoro
-                if page_boundary_active and last_subtotal_saldo is not None and abs(val - last_subtotal_saldo) < 0.0001 and rows[idx0].get("Importe_Parsed") is None:
-                    continue
+            # Si justo venía un “Saldo” -> asigno saldo al último movimiento
+            if val is not None and expecting_saldo_for_last and last_movement_idx is not None:
+                rows[last_movement_idx]["Saldo"] = val
+                expecting_saldo_for_last = False
+                continue
 
-                idx = pending_indices.pop(0)
-                attach_detail(idx)
-                rows[idx]["Saldo"] = val
-                if not (last_subtotal_saldo is not None and abs(val - last_subtotal_saldo) < 0.0001):
-                    page_boundary_active = False
-            else:
-                pending_detail.append(ln)
+            # Si no era saldo, lo dejo como detalle (puede ser “importe suelto” por OCR)
+            expecting_saldo_for_last = False
+            pending_detail.append(ln)
             continue
 
-        # ===== 3) MOVIMIENTO CON FECHA =====
+        # Movimiento con fecha
         if date_re.match(ln):
             attach_detail(last_movement_idx)
 
-            tokens = ln.split()
+            tokens = join_split_decimals(ln.split())
             fecha = tokens[0]
             rest, amt_tokens = extract_tail_amounts(tokens[1:])
 
             saldo = None
             mov_amt = None
 
+            # Si hay 2 importes al final: [importe, saldo]
             if len(amt_tokens) >= 2:
                 mov_amt = normalize_amount(amt_tokens[-2])
                 saldo = normalize_amount(amt_tokens[-1])
             elif len(amt_tokens) == 1:
                 mov_amt = normalize_amount(amt_tokens[0])
 
+            # Referencia numérica si existe
             referencia = None
             for t in reversed(rest):
                 if re.fullmatch(r"\d{6,}", t):
@@ -276,9 +266,9 @@ def etl_banco_actual_txt_to_excel_bytes(txt_bytes: bytes):
 
             concepto_tokens = rest[:]
             if referencia and referencia in concepto_tokens:
-                for i in range(len(concepto_tokens) - 1, -1, -1):
-                    if concepto_tokens[i] == referencia:
-                        concepto_tokens.pop(i)
+                for k in range(len(concepto_tokens) - 1, -1, -1):
+                    if concepto_tokens[k] == referencia:
+                        concepto_tokens.pop(k)
                         break
 
             concepto = " ".join(concepto_tokens).strip()
@@ -289,88 +279,115 @@ def etl_banco_actual_txt_to_excel_bytes(txt_bytes: bytes):
                 "Concepto": concepto,
                 "Referencia": referencia,
                 "Importe_Parsed": mov_amt,
-                "Debito": None,
-                "Credito": None,
                 "Saldo": saldo,
                 "Detalle": None
             })
 
             last_movement_idx = len(rows) - 1
-            if saldo is None or mov_amt is None:
-                pending_indices.append(last_movement_idx)
+            expecting_saldo_for_last = False
             continue
 
+        # Continuación no-fecha: lo guardo como detalle
         pending_detail.append(ln)
 
     attach_detail(last_movement_idx)
 
     raw_df = pd.DataFrame(rows)
+
+    # =========================
+    # Post-proceso: movimientos
+    # =========================
     mov = raw_df[raw_df["Tipo"] == "MOVIMIENTO"].copy().reset_index(drop=True)
 
-    for c in ["Importe_Parsed", "Saldo", "Debito", "Credito"]:
-        if c in mov.columns:
-            mov[c] = pd.to_numeric(mov[c], errors="coerce")
+    for c in ["Importe_Parsed", "Saldo"]:
+        mov[c] = pd.to_numeric(mov[c], errors="coerce")
 
-    # Débito/Credito por delta de saldo (SIN perder importes chicos)
-    tol = 0.0001
-    prev_saldo = opening_saldo
+    # --- PASO CLAVE: completar saldos faltantes usando saldos "candidatos" que quedaron en Detalle ---
+    # Heurística: si un movimiento no tiene saldo, pero su Detalle contiene un número "con decimales",
+    # tomo el ÚLTIMO número de detalle como saldo probable.
+    def extract_last_amount_from_detail(detail: str):
+        if not isinstance(detail, str) or not detail.strip():
+            return None
+        # busco tokens "parecidos a importe"
+        toks = join_split_decimals(detail.replace("\n", " ").split())
+        candidates = [t for t in toks if is_amount_token(t)]
+        if not candidates:
+            # fallback: casos donde OCR deja "873,519.92" como token válido pero nuestro regex no lo capturó:
+            # (igual debería, pero por las dudas)
+            candidates = re.findall(r"-?\d[\d\.,]*\d", detail)
+        if not candidates:
+            return None
+        val = normalize_amount(candidates[-1])
+        return val
 
     for i in range(len(mov)):
-        # si ya quedó debit/credit explícito por parse (caso 3 importes), lo dejo
-        if (not pd.isna(mov.at[i, "Debito"])) or (not pd.isna(mov.at[i, "Credito"])):
-            if not pd.isna(mov.at[i, "Saldo"]):
-                prev_saldo = mov.at[i, "Saldo"]
-            continue
+        if pd.isna(mov.at[i, "Saldo"]):
+            det = mov.at[i, "Detalle"] if "Detalle" in mov.columns else None
+            guess = extract_last_amount_from_detail(det)
+            if guess is not None:
+                mov.at[i, "Saldo"] = guess
 
+    # =========================
+    # Débito / Crédito por delta (garantiza cierre si saldos están bien)
+    # =========================
+    mov["Debito"] = np.nan
+    mov["Credito"] = np.nan
+
+    tol = 0.01
+
+    prev = opening_saldo
+    for i in range(len(mov)):
         saldo = mov.at[i, "Saldo"]
-        imp = mov.at[i, "Importe_Parsed"]
 
-        mov.at[i, "Debito"] = np.nan
-        mov.at[i, "Credito"] = np.nan
-
-        if pd.isna(saldo) or prev_saldo is None or pd.isna(prev_saldo):
-            if not pd.isna(imp):
-                # fallback mínimo si no hay saldo
-                c = str(mov.at[i, "Concepto"]).lower()
-                if "comercios first data" in c or "crédito" in c:
-                    mov.at[i, "Credito"] = abs(float(imp))
-                else:
-                    mov.at[i, "Debito"] = abs(float(imp))
-            prev_saldo = saldo if not pd.isna(saldo) else prev_saldo
+        if pd.isna(saldo) or prev is None or (isinstance(prev, float) and np.isnan(prev)):
+            prev = saldo if not pd.isna(saldo) else prev
             continue
 
-        delta = saldo - prev_saldo
+        delta = saldo - prev
 
         if abs(delta) <= tol:
-            # delta casi 0, pero si hay importe, lo uso (clave para 0.02, 0.04, 0.06, etc.)
+            # casi 0: si hay importe parseado, uso eso
+            imp = mov.at[i, "Importe_Parsed"]
             if not pd.isna(imp) and abs(float(imp)) > tol:
-                c = str(mov.at[i, "Concepto"]).lower()
-                if "comercios first data" in c or "crédito" in c:
-                    mov.at[i, "Credito"] = abs(float(imp))
-                else:
-                    mov.at[i, "Debito"] = abs(float(imp))
+                # Por defecto: si no hay forma de saber, lo pongo como débito
+                mov.at[i, "Debito"] = abs(float(imp))
+            prev = saldo
+            continue
+
+        if delta > 0:
+            mov.at[i, "Credito"] = abs(delta)
         else:
-            amt = abs(delta)
-            if delta > 0:
-                mov.at[i, "Credito"] = amt
-            else:
-                mov.at[i, "Debito"] = amt
+            mov.at[i, "Debito"] = abs(delta)
 
-        prev_saldo = saldo
+        prev = saldo
 
-    mov_final = mov.drop(columns=["Tipo"], errors="ignore")
+    # =========================
+    # Auditoría de cierre
+    # =========================
+    mov["Debito"] = mov["Debito"].fillna(0.0)
+    mov["Credito"] = mov["Credito"].fillna(0.0)
 
+    mov["Saldo_calc"] = opening_saldo + (mov["Credito"] - mov["Debito"]).cumsum()
+    mov["Diff_Saldo"] = (mov["Saldo"] - mov["Saldo_calc"]).round(2)
+
+    mov["Flag"] = np.where(mov["Diff_Saldo"].abs() > 0.01, "ERROR", "OK")
+
+    # =========================
+    # Export Excel
+    # =========================
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp_path = Path(tmp.name)
 
     with pd.ExcelWriter(tmp_path, engine="openpyxl") as writer:
-        mov_final.to_excel(writer, sheet_name="Movimientos", index=False)
+        mov.to_excel(writer, sheet_name="Movimientos", index=False)
         raw_df.to_excel(writer, sheet_name="Raw_Parse", index=False)
+        mov[mov["Flag"] == "ERROR"].to_excel(writer, sheet_name="Auditoria", index=False)
 
     excel_bytes = tmp_path.read_bytes()
     tmp_path.unlink(missing_ok=True)
 
-    return excel_bytes, mov_final, raw_df
+    return excel_bytes, mov, raw_df
+
 
 # =========================
 # “Framework” para futuros ETLs
@@ -449,5 +466,6 @@ with tabs[2]:
 
 st.divider()
 st.caption("App preparada para múltiples ETLs: cada tab puede tener su propio parser y validaciones.")
+
 
 
