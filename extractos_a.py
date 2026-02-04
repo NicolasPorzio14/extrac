@@ -1,15 +1,16 @@
-# app_streamlit_extracto.py
-# Streamlit: subís el .txt (texto copiado del PDF con OCR ya hecho) y descarga un Excel:
-# - Movimientos (fecha, concepto, referencia, importe leído/inferido, débito/crédito, saldo, delta)
-# - Auditoría (flags / inconsistencias)
+# app.py
+# Streamlit ETL: TXT (copiado de PDF con OCR) -> Excel (Movimientos + Auditoría)
 #
 # Ejecutar:
 #   pip install streamlit pandas openpyxl
-#   streamlit run app_streamlit_extracto.py
+#   streamlit run app.py
 #
-# Nota:
-#   Este parser es heurístico (porque depende de cómo quedó el OCR).
-#   La lógica clave es: CLASIFICAR DÉBITO/CRÉDITO POR CAMBIO DE SALDO (delta saldo).
+# Qué hace:
+# - Subís un .txt con el contenido copiado del PDF (OCR ya hecho).
+# - Parseo robusto: fecha, concepto, referencia, importe, saldo.
+# - Débito/Crédito se clasifica por delta de saldo (regla principal).
+# - Auditoría: delta vs importe, filas sin importe, delta 0, sin saldo, etc.
+# - Descargás un .xlsx con 2 hojas: Movimientos y Auditoría.
 
 from __future__ import annotations
 
@@ -24,28 +25,54 @@ import streamlit as st
 
 
 # =========================================================
-# Helpers numéricos / parsing
+# Config UI
 # =========================================================
+st.set_page_config(page_title="ETL Extracto → Excel", page_icon="📄", layout="wide")
+
+st.title("📄 ETL Extracto bancario (TXT OCR) → Excel")
+st.caption("Subí el TXT copiado del PDF (OCR ya hecho). Genera Excel con auditoría lógica por SALDO.")
+
+
+# =========================================================
+# Regex / parsing helpers
+# =========================================================
+DATE_RE = re.compile(r"^(?P<d>\d{2}/\d{2}/\d{2})\b")
+
+# Token monetario (termina en 2 decimales)
+MONEY_TOKEN_RE = re.compile(
+    r"^[+-]?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})$|^[+-]?\d+(?:[.,]\d{2})$"
+)
+
+INT_TOKEN_RE = re.compile(r"^\d+$")
+
 
 def _clean_ocr_weird_chars(s: str) -> str:
     repl = {
         "Dв": "DB",
         "DВ": "DB",
-        "ARBА": "ARBA",  # A cirílica
-        "С": "C",        # C cirílica
-        "О": "O",        # O cirílica
+        "DBв": "DB",
+        "ARBА": "ARBA",
+        "С": "C",
+        "О": "O",
+        "–": "-",
+        "−": "-",
     }
     for k, v in repl.items():
         s = s.replace(k, v)
+
+    # OCR típico: "115.5o" -> "115.50"
+    s = re.sub(r"(\d)[oO](\b|$)", r"\g<1>0\2", s)
     return s
+
 
 def parse_ar_number(token: str) -> Optional[float]:
     """
-    Parser robusto para OCR:
-    - 1.234,56 / 1234,56
-    - 1,234.56 / 1234.56
-    - 1.648.32  (OCR: miles con puntos + decimal con punto)
-    - -155.642.50 (OCR)
+    Convierte números estilo AR/mixto a float.
+    Soporta:
+      - 1.234,56 / 1234,56
+      - 1,234.56 / 1234.56
+      - 1.648.32 (OCR: miles con puntos + decimal con punto)
+      - -155.642.50 (OCR)
     """
     t = token.strip()
     if not t:
@@ -56,17 +83,15 @@ def parse_ar_number(token: str) -> Optional[float]:
     sign = -1.0 if t.startswith("-") else 1.0
     t2 = t.lstrip("+-")
 
-    # Caso OCR: múltiples puntos y el último grupo tiene 2 dígitos => último punto es decimal
+    # OCR: múltiples puntos y NO coma => si último grupo tiene 2 dígitos, último punto es decimal
     if "." in t2 and t2.count(".") >= 2 and "," not in t2:
         parts = t2.split(".")
         if len(parts[-1]) == 2 and all(p.isdigit() for p in parts):
-            # miles = todo menos el último, decimal = último
             t2 = "".join(parts[:-1]) + "." + parts[-1]
         else:
-            # si no cumple, asumimos que son miles
             t2 = t2.replace(".", "")
 
-    # Caso OCR: múltiples comas y el último grupo tiene 2 dígitos => último es decimal
+    # Múltiples comas y NO punto (raro): si último grupo tiene 2 dígitos => decimal
     if "," in t2 and t2.count(",") >= 2 and "." not in t2:
         parts = t2.split(",")
         if len(parts[-1]) == 2 and all(p.isdigit() for p in parts):
@@ -74,7 +99,7 @@ def parse_ar_number(token: str) -> Optional[float]:
         else:
             t2 = t2.replace(",", "")
 
-    # Mixtos coma+punto: decide por el último separador
+    # Mixto coma+punto: decide por el ÚLTIMO separador
     if "," in t2 and "." in t2:
         last_comma = t2.rfind(",")
         last_dot = t2.rfind(".")
@@ -95,12 +120,9 @@ def parse_ar_number(token: str) -> Optional[float]:
     except ValueError:
         return None
 
-DATE_RE = re.compile(r"^(?P<d>\d{2}/\d{2}/\d{2})\b")
-NUMBER_TOKEN_RE = re.compile(r"[-+]?\d[\d\.,]*$")
 
-
-def parse_date(s: str) -> Optional[datetime]:
-    m = DATE_RE.match(s.strip())
+def parse_date(line: str) -> Optional[datetime]:
+    m = DATE_RE.match(line.strip())
     if not m:
         return None
     try:
@@ -117,11 +139,11 @@ def is_header_noise(line: str) -> bool:
         "DETALLE DE MOVIMIENTOS",
         "RESUMEN DE CUENTA",
         "CUENTA CORRIENTE",
-        "I.V.A.",
         "FECHA CONCEPTO",
         "DÉBITO CRÉDITO SALDO",
         "DEBITO CREDITO SALDO",
         "SUBTOTAL",
+        "I.V.A.",
         "C.U.I.T",
         "NRO COMERCIO",
         "MARCA:",
@@ -135,39 +157,76 @@ def is_header_noise(line: str) -> bool:
     return any(x in l for x in noisy)
 
 
-def _extract_tail_numbers_with_tokens(line: str) -> Tuple[List[Tuple[str, float]], str]:
+def _looks_like_page_number_only(line: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,4}", line.strip()))
+
+
+def _extract_tail_money_and_ref(line: str) -> Tuple[Optional[float], Optional[float], Optional[str], str]:
     """
-    Devuelve lista de pares (token_original, valor_float) extraídos desde el final.
+    Extrae desde el final:
+      - saldo = último token monetario
+      - importe = token monetario anterior al saldo
+      - referencia = entero largo (8-14 dígitos) cercano al final
+    Devuelve: (importe, saldo, referencia, texto_restante)
     """
     parts = line.strip().split()
-    out: List[Tuple[str, float]] = []
+    if not parts:
+        return None, None, None, ""
 
-    while parts:
-        tok = parts[-1]
-        if not NUMBER_TOKEN_RE.fullmatch(tok):
-            break
-        val = parse_ar_number(tok)
-        if val is None:
-            break
-        out.append((tok, val))
-        parts.pop()
+    money_vals: List[Tuple[int, float]] = []
+    ref: Optional[str] = None
 
-    out.reverse()
-    rest = " ".join(parts).strip()
-    return out, rest
+    # Recorremos desde la derecha
+    for i in range(len(parts) - 1, -1, -1):
+        tok = parts[i]
+
+        if MONEY_TOKEN_RE.fullmatch(tok):
+            val = parse_ar_number(tok)
+            if val is not None:
+                money_vals.append((i, val))
+            continue
+
+        # referencia: entero largo sin decimales
+        if INT_TOKEN_RE.fullmatch(tok) and 8 <= len(tok) <= 14 and ref is None:
+            ref = tok
+            continue
+
+        # si ya estamos fuera de la "cola" (texto normal), cortamos
+        break
+
+    money_vals.sort(key=lambda x: x[0])
+
+    saldo = money_vals[-1][1] if len(money_vals) >= 1 else None
+    importe = money_vals[-2][1] if len(money_vals) >= 2 else None
+
+    # recorte de texto: todo lo que queda antes de la primera "cola" detectada
+    cut_idx_candidates = []
+    if money_vals:
+        cut_idx_candidates.append(money_vals[0][0])
+
+    if ref is not None:
+        for j in range(len(parts) - 1, -1, -1):
+            if parts[j] == ref:
+                cut_idx_candidates.append(j)
+                break
+
+    cut_idx = min(cut_idx_candidates) if cut_idx_candidates else len(parts)
+    rest = " ".join(parts[:cut_idx]).strip()
+
+    return importe, saldo, ref, rest
+
 
 # =========================================================
-# Modelo
+# Modelo y ETL
 # =========================================================
-
 @dataclass
 class Movimiento:
     fecha: Optional[datetime]
     concepto: str
     referencia: Optional[str]
-    importe: Optional[float]   # importe “leído” desde OCR (si existe)
-    saldo: Optional[float]     # saldo “leído” desde OCR (si existe)
-    # Derivados:
+    importe: Optional[float]  # leído
+    saldo: Optional[float]    # leído
+    # derivados
     delta_saldo: Optional[float] = None
     debito: float = 0.0
     credito: float = 0.0
@@ -176,13 +235,8 @@ class Movimiento:
     flags: str = ""
 
 
-# =========================================================
-# Parser movimientos
-# =========================================================
-
 def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
     raw_lines = [_clean_ocr_weird_chars(x.rstrip("\n")) for x in text.splitlines()]
-
     movimientos: List[Movimiento] = []
 
     cur_fecha: Optional[datetime] = None
@@ -191,14 +245,10 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
     cur_importe: Optional[float] = None
     cur_saldo: Optional[float] = None
 
-    # Ajustable: si el saldo parseado excede esto, probablemente el OCR pegó referencia+saldo o algo raro
-    MAX_ABS_SALDO = 1_000_000_000.0  # 1e9
-
     def flush_current():
         nonlocal cur_fecha, cur_text_parts, cur_ref, cur_importe, cur_saldo
         concepto = " ".join([p for p in cur_text_parts if p]).strip()
-
-        if concepto or cur_importe is not None or cur_saldo is not None:
+        if (cur_fecha is not None) and (concepto or cur_importe is not None or cur_saldo is not None):
             movimientos.append(
                 Movimiento(
                     fecha=cur_fecha,
@@ -208,143 +258,60 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
                     saldo=cur_saldo,
                 )
             )
-
         cur_fecha = None
         cur_text_parts = []
         cur_ref = None
         cur_importe = None
         cur_saldo = None
 
-    def looks_like_ref_token(tok: str) -> bool:
-        # Referencia típica: 8–14 dígitos, SIN decimales (sin ,dd o .dd)
-        raw = re.sub(r"[^\d]", "", tok)
-        if not (raw.isdigit() and 8 <= len(raw) <= 14):
-            return False
-        # si termina en decimales -> no es ref
-        if re.search(r"[.,]\d{2}$", tok):
-            return False
-        return True
-
-    def looks_like_money_token(tok: str) -> bool:
-        # Dinero típico: termina con 2 decimales
-        # (por OCR puede venir con ',' o '.')
-        return re.search(r"[.,]\d{2}$", tok) is not None
-
-    def extract_tail_pairs(line: str) -> Tuple[List[Tuple[str, float]], str]:
-        """
-        Devuelve lista de (token_crudo, float) extraída desde el final.
-        """
-        parts = line.strip().split()
-        out: List[Tuple[str, float]] = []
-
-        while parts:
-            tok = parts[-1]
-            if not NUMBER_TOKEN_RE.fullmatch(tok):
-                break
-            val = parse_ar_number(tok)
-            if val is None:
-                break
-            out.append((tok, val))
-            parts.pop()
-
-        out.reverse()
-        rest_ = " ".join(parts).strip()
-        return out, rest_
-
     for line in raw_lines:
         line = line.strip()
         if not line or is_header_noise(line):
             continue
 
-        # Nuevo movimiento si arranca con fecha
+        # Paginado solo: "179"
+        if _looks_like_page_number_only(line):
+            continue
+
+        # Caso "13 93,416.95" (contador + saldo)
+        parts2 = line.split()
+        if len(parts2) == 2 and _looks_like_page_number_only(parts2[0]) and MONEY_TOKEN_RE.fullmatch(parts2[1]):
+            line = parts2[1]
+
         dt = parse_date(line)
         if dt is not None:
             flush_current()
             cur_fecha = dt
             line = DATE_RE.sub("", line, count=1).strip()
 
-        pairs, rest = extract_tail_pairs(line)
+        # Si todavía no comenzó un movimiento, ignoramos ruido
+        if cur_fecha is None:
+            continue
 
-        # Referencia desde el texto "rest" (si quedó fuera de la cola numérica)
-        # Ej: "IVA 0970300052" sin importes en esa línea
-        ref_match = re.search(r"\b(\d{8,14})\b$", rest)
-        if ref_match and cur_ref is None:
-            cur_ref = ref_match.group(1)
-            rest = rest[: ref_match.start(1)].strip()
+        imp, sal, ref, rest = _extract_tail_money_and_ref(line)
+
+        # referencia desde rest si quedó ahí (sin estar en cola)
+        if cur_ref is None:
+            mref = re.search(r"\b(\d{8,14})\b$", rest)
+            if mref:
+                cur_ref = mref.group(1)
+                rest = rest[: mref.start(1)].strip()
+
+        if ref and cur_ref is None:
+            cur_ref = ref
 
         if rest:
             cur_text_parts.append(rest)
 
-        if not pairs:
-            continue
-
-        # Clasificación de tokens de cola
-        tail = []
-        for tok, val in pairs:
-            kind = "unknown"
-            if looks_like_money_token(tok):
-                kind = "money"
-            elif looks_like_ref_token(tok):
-                kind = "ref"
-            tail.append((tok, val, kind))
-
-        # 1) Saldos: el ÚLTIMO token money (de derecha a izquierda)
-        saldo_val = None
-        saldo_idx = None
-        for i in range(len(tail) - 1, -1, -1):
-            tok, val, kind = tail[i]
-            if kind == "money":
-                # plausibilidad
-                if abs(val) <= MAX_ABS_SALDO:
-                    saldo_val = val
-                    saldo_idx = i
-                    break
-
-        # 2) Importe: token money anterior al saldo
-        importe_val = None
-        if saldo_idx is not None:
-            for j in range(saldo_idx - 1, -1, -1):
-                tok, val, kind = tail[j]
-                if kind == "money":
-                    importe_val = val
-                    break
-
-        # 3) Referencia: token ref más cercano al final
-        ref_val = None
-        for i in range(len(tail) - 1, -1, -1):
-            tok, val, kind = tail[i]
-            if kind == "ref":
-                ref_val = re.sub(r"[^\d]", "", tok)
-                break
-
-        # Aplicamos lo encontrado (sin pisar si ya estaba seteado por líneas previas)
-        if ref_val is not None:
-            cur_ref = ref_val
-
-        # saldo: solo si encontramos un money plausible
-        if saldo_val is not None:
-            cur_saldo = saldo_val
-
-        # importe: si encontramos
-        if importe_val is not None:
-            cur_importe = importe_val
-        else:
-            # Caso “REF + SALDO” (sin importe en esa línea) => dejamos importe None
-            pass
+        # saldo es lo más importante
+        if sal is not None and cur_saldo is None:
+            cur_saldo = sal
+        if imp is not None and cur_importe is None:
+            cur_importe = imp
 
     flush_current()
-
-    movimientos = [
-        m for m in movimientos
-        if (m.fecha is not None or m.concepto) and (m.saldo is not None or m.importe is not None)
-    ]
     return movimientos
 
-
-
-# =========================================================
-# Auditoría y clasificación
-# =========================================================
 
 def audit_and_classify(movs: List[Movimiento], tol: float = 0.01) -> List[Movimiento]:
     prev_saldo: Optional[float] = None
@@ -370,7 +337,7 @@ def audit_and_classify(movs: List[Movimiento], tol: float = 0.01) -> List[Movimi
         delta = m.saldo - prev_saldo
         m.delta_saldo = delta
 
-        # Débito/Crédito por delta de saldo
+        # Débito/Crédito por delta saldo
         if abs(delta) <= tol:
             m.debito = 0.0
             m.credito = 0.0
@@ -382,7 +349,7 @@ def audit_and_classify(movs: List[Movimiento], tol: float = 0.01) -> List[Movimi
             m.debito = round(-delta, 2)
             m.credito = 0.0
 
-        # Auditoría importe
+        # Auditoría de importe
         if m.importe is None:
             m.importe_inferido = round(abs(delta), 2)
             flags.append("IMPORTE_INFERIDO_POR_SALDO")
@@ -407,27 +374,25 @@ def movimientos_to_dfs(movs: List[Movimiento]) -> tuple[pd.DataFrame, pd.DataFra
     for idx, m in enumerate(movs, start=1):
         rows.append({
             "N": idx,
-            "fecha": m.fecha.strftime("%d/%m/%y") if m.fecha else None,
-            "concepto": m.concepto,
-            "referencia": m.referencia,
-            "importe": m.importe if m.importe is not None else m.importe_inferido,
-            "debito": m.debito,
-            "credito": m.credito,
-            "saldo": m.saldo,
-            "delta_saldo": m.delta_saldo,
-            "ok_auditoria": m.ok_auditoria,
-            "flags": m.flags,
-            "importe_leido": m.importe,
-            "importe_inferido": m.importe_inferido,
+            "Fecha": m.fecha.strftime("%d/%m/%y") if m.fecha else None,
+            "Concepto": m.concepto,
+            "Referencia": str(m.referencia) if m.referencia is not None else None,
+            "Importe_Leido": m.importe,
+            "Importe_Inferido": m.importe_inferido,
+            "Importe_Final": (m.importe if m.importe is not None else m.importe_inferido),
+            "Débito": m.debito,
+            "Crédito": m.credito,
+            "Saldo": m.saldo,
+            "Delta_Saldo": m.delta_saldo,
+            "OK_Auditoría": m.ok_auditoria,
+            "Flags": m.flags,
         })
+    df_mov = pd.DataFrame(rows)
 
-    df = pd.DataFrame(rows)
+    df_aud = df_mov[(df_mov["OK_Auditoría"] == False) | (df_mov["Flags"].fillna("") != "")]
+    df_aud = df_aud.sort_values(["OK_Auditoría", "N"], ascending=[True, True])
 
-    # Errores: lo que no pasó auditoría o tiene flags
-    df_errors = df[(df["ok_auditoria"] == False) | (df["flags"].fillna("") != "")]
-    df_errors = df_errors.sort_values(["ok_auditoria", "N"], ascending=[True, True])
-
-    return df, df_errors
+    return df_mov, df_aud
 
 
 def build_excel_bytes(df_mov: pd.DataFrame, df_aud: pd.DataFrame) -> bytes:
@@ -436,7 +401,6 @@ def build_excel_bytes(df_mov: pd.DataFrame, df_aud: pd.DataFrame) -> bytes:
         df_mov.to_excel(writer, sheet_name="Movimientos", index=False)
         df_aud.to_excel(writer, sheet_name="Auditoría", index=False)
 
-        # Ajuste simple de anchos + freeze
         for sheet_name in ["Movimientos", "Auditoría"]:
             ws = writer.book[sheet_name]
             ws.freeze_panes = "A2"
@@ -445,8 +409,7 @@ def build_excel_bytes(df_mov: pd.DataFrame, df_aud: pd.DataFrame) -> bytes:
                 max_len = 0
                 for cell in col:
                     v = "" if cell.value is None else str(cell.value)
-                    if len(v) > max_len:
-                        max_len = len(v)
+                    max_len = max(max_len, len(v))
                 ws.column_dimensions[col_letter].width = min(max(10, max_len + 2), 60)
 
     output.seek(0)
@@ -454,41 +417,34 @@ def build_excel_bytes(df_mov: pd.DataFrame, df_aud: pd.DataFrame) -> bytes:
 
 
 # =========================================================
-# UI Streamlit (similar a tu captura)
+# UI
 # =========================================================
-
-st.set_page_config(page_title="ETL Extracto → Excel", page_icon="📄", layout="wide")
-
-st.title("📄 ETL Extracto bancario (TXT OCR) → Excel")
-st.caption("Subí el TXT copiado del PDF (OCR ya hecho) y generá un Excel con auditoría lógica por SALDO.")
-
-# Sidebar con parámetros
 with st.sidebar:
-    st.header("⚙️ Parámetros")
-    tol = st.number_input("Tolerancia auditoría (pesos)", min_value=0.0, value=0.01, step=0.01, format="%.2f")
+    st.header("🧰 Cómo usar")
     st.markdown(
         """
-**Regla clave:**
-- Débito/Crédito se clasifica **por cambio de saldo** (delta).
+1) Hacé OCR al PDF (vos ya lo hacés en Colab).  
+2) Abrí el PDF y copiá el texto.  
+3) Pegalo en un `.txt`.  
+4) Subí el `.txt` acá.  
+5) Descargá el Excel.
 
-**Auditoría:**
-- Delta saldo debe coincidir con importe (leído o inferido).
-- No deben quedar líneas sin importe.
+**Regla clave:** Débito/Crédito se clasifica por **delta de saldo**.
         """
     )
+    st.divider()
+    tol = st.number_input("Tolerancia auditoría (pesos)", min_value=0.0, value=0.01, step=0.01, format="%.2f")
 
-col_left, col_right = st.columns([1.05, 1.25], gap="large")
 
-# -------- Left: Upload + botón
-with col_left:
-    st.subheader("📥 Cargar Archivo")
-    uploaded = st.file_uploader("Selecciona el archivo .txt", type=["txt"])
+c1, c2 = st.columns([1.05, 1.25], gap="large")
 
+with c1:
+    st.subheader("📥 Cargar archivo")
+    uploaded = st.file_uploader("Archivo .txt", type=["txt"])
     process = st.button("PROCESAR", type="primary", use_container_width=True, disabled=(uploaded is None))
 
-# -------- Right: Preview
-with col_right:
-    st.subheader("📊 Vista Previa")
+with c2:
+    st.subheader("📊 Vista previa")
 
     if "df_mov" not in st.session_state:
         st.session_state.df_mov = None
@@ -497,15 +453,14 @@ with col_right:
 
     if process and uploaded is not None:
         txt = uploaded.getvalue().decode("utf-8", errors="ignore")
-
         movs = parse_movimientos_from_txt_text(txt)
         movs = audit_and_classify(movs, tol=float(tol))
-
         df_mov, df_aud = movimientos_to_dfs(movs)
+        excel_bytes = build_excel_bytes(df_mov, df_aud)
 
         st.session_state.df_mov = df_mov
         st.session_state.df_aud = df_aud
-        st.session_state.excel_bytes = build_excel_bytes(df_mov, df_aud)
+        st.session_state.excel_bytes = excel_bytes
 
     df_mov = st.session_state.df_mov
     df_aud = st.session_state.df_aud
@@ -514,43 +469,31 @@ with col_right:
     if df_mov is None or df_mov.empty:
         st.info("Subí un TXT y tocá **PROCESAR** para ver la vista previa.")
     else:
-        # Métricas como tu captura
-        saldo_inicial = df_mov["saldo"].dropna().iloc[0] if df_mov["saldo"].notna().any() else None
-        saldo_final = df_mov["saldo"].dropna().iloc[-1] if df_mov["saldo"].notna().any() else None
-        errores = int(len(df_aud)) if df_aud is not None else 0
         total = int(len(df_mov))
+        errores = int(len(df_aud)) if df_aud is not None else 0
 
-        m1, m2, m3 = st.columns(3)
+        saldo_inicial = df_mov["Saldo"].dropna().iloc[0] if df_mov["Saldo"].notna().any() else None
+        saldo_final = df_mov["Saldo"].dropna().iloc[-1] if df_mov["Saldo"].notna().any() else None
+
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total movimientos", f"{total}")
         m2.metric("Saldo inicial", f"${saldo_inicial:,.2f}" if saldo_inicial is not None else "N/D")
         m3.metric("Saldo final", f"${saldo_final:,.2f}" if saldo_final is not None else "N/D")
-
-        m4, _ = st.columns([1, 2])
         m4.metric("Errores", f"{errores}")
 
-        # Tabla (preview)
-        preview_cols = ["fecha", "concepto", "importe", "debito", "credito", "saldo"]
         st.dataframe(
-            df_mov[preview_cols].head(30),
+            df_mov[["Fecha", "Concepto", "Importe_Final", "Débito", "Crédito", "Saldo", "Flags"]].head(40),
             use_container_width=True,
             hide_index=True
         )
 
-        # Botón descarga Excel
         st.download_button(
             label="⬇️ Descargar Excel",
             data=excel_bytes,
             file_name="Extracto_ETL.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
+            use_container_width=True,
         )
 
-        # Panel de auditoría opcional
-        with st.expander("Ver auditoría / flags (primeros 200)"):
-            st.dataframe(
-                df_aud.head(200),
-                use_container_width=True,
-                hide_index=True
-            )
-
-
+        with st.expander("Ver auditoría / flags (primeros 300)"):
+            st.dataframe(df_aud.head(300), use_container_width=True, hide_index=True)
