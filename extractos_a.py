@@ -181,17 +181,6 @@ class Movimiento:
 # =========================================================
 
 def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
-    """
-    Parser robusto:
-    - Detecta inicio de movimiento por fecha DD/MM/YY.
-    - Extrae números del final de la línea.
-    - Interpreta cola numérica como:
-        * ... IMPORTE SALDO
-        * ... REF SALDO
-        * ... REF IMPORTE SALDO
-      donde REF es un entero largo (8–14 dígitos) sin separadores.
-    - Si el OCR parte el movimiento en varias líneas, acumula texto y completa cuando aparecen números.
-    """
     raw_lines = [_clean_ocr_weird_chars(x.rstrip("\n")) for x in text.splitlines()]
 
     movimientos: List[Movimiento] = []
@@ -202,9 +191,13 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
     cur_importe: Optional[float] = None
     cur_saldo: Optional[float] = None
 
+    # Ajustable: si el saldo parseado excede esto, probablemente el OCR pegó referencia+saldo o algo raro
+    MAX_ABS_SALDO = 1_000_000_000.0  # 1e9
+
     def flush_current():
         nonlocal cur_fecha, cur_text_parts, cur_ref, cur_importe, cur_saldo
         concepto = " ".join([p for p in cur_text_parts if p]).strip()
+
         if concepto or cur_importe is not None or cur_saldo is not None:
             movimientos.append(
                 Movimiento(
@@ -215,6 +208,7 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
                     saldo=cur_saldo,
                 )
             )
+
         cur_fecha = None
         cur_text_parts = []
         cur_ref = None
@@ -222,13 +216,23 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
         cur_saldo = None
 
     def looks_like_ref_token(tok: str) -> bool:
-        # referencia típica: 8 a 14 dígitos puros (sin comas/puntos), o sea "0970300052"
+        # Referencia típica: 8–14 dígitos, SIN decimales (sin ,dd o .dd)
         raw = re.sub(r"[^\d]", "", tok)
-        return raw.isdigit() and 8 <= len(raw) <= 14 and ("," not in tok) and ("." not in tok)
+        if not (raw.isdigit() and 8 <= len(raw) <= 14):
+            return False
+        # si termina en decimales -> no es ref
+        if re.search(r"[.,]\d{2}$", tok):
+            return False
+        return True
+
+    def looks_like_money_token(tok: str) -> bool:
+        # Dinero típico: termina con 2 decimales
+        # (por OCR puede venir con ',' o '.')
+        return re.search(r"[.,]\d{2}$", tok) is not None
 
     def extract_tail_pairs(line: str) -> Tuple[List[Tuple[str, float]], str]:
         """
-        Igual que _extract_tail_numbers, pero devuelve token crudo + float.
+        Devuelve lista de (token_crudo, float) extraída desde el final.
         """
         parts = line.strip().split()
         out: List[Tuple[str, float]] = []
@@ -259,12 +263,10 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
             cur_fecha = dt
             line = DATE_RE.sub("", line, count=1).strip()
 
-        # Extrae pares (token, valor) al final
         pairs, rest = extract_tail_pairs(line)
 
-        # 1) Referencia desde el texto (si termina en bloque largo)
-        #    (Esto captura casos tipo: "Comision ... 0970300052 17,286.00 173,635.58"
-        #     donde la ref queda en rest si no fue tomada como número por el parser)
+        # Referencia desde el texto "rest" (si quedó fuera de la cola numérica)
+        # Ej: "IVA 0970300052" sin importes en esa línea
         ref_match = re.search(r"\b(\d{8,14})\b$", rest)
         if ref_match and cur_ref is None:
             cur_ref = ref_match.group(1)
@@ -273,46 +275,61 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
         if rest:
             cur_text_parts.append(rest)
 
-        # 2) Interpretación de la cola numérica (desde derecha)
-        #    último = saldo
-        #    penúltimo = importe o referencia
-        #    antepenúltimo = referencia (si existe)
-        if len(pairs) >= 1:
-            tok_saldo, val_saldo = pairs[-1]
-            cur_saldo = val_saldo
+        if not pairs:
+            continue
 
-        if len(pairs) == 2:
-            tok2, val2 = pairs[-2]
+        # Clasificación de tokens de cola
+        tail = []
+        for tok, val in pairs:
+            kind = "unknown"
+            if looks_like_money_token(tok):
+                kind = "money"
+            elif looks_like_ref_token(tok):
+                kind = "ref"
+            tail.append((tok, val, kind))
 
-            if looks_like_ref_token(tok2):
-                # REF + SALDO (no hay importe en esta línea)
-                cur_ref = re.sub(r"[^\d]", "", tok2)
-                # no seteamos cur_importe acá
-            else:
-                # IMPORTE + SALDO
-                cur_importe = val2
+        # 1) Saldos: el ÚLTIMO token money (de derecha a izquierda)
+        saldo_val = None
+        saldo_idx = None
+        for i in range(len(tail) - 1, -1, -1):
+            tok, val, kind = tail[i]
+            if kind == "money":
+                # plausibilidad
+                if abs(val) <= MAX_ABS_SALDO:
+                    saldo_val = val
+                    saldo_idx = i
+                    break
 
-        elif len(pairs) >= 3:
-            tok3, val3 = pairs[-3]
-            tok2, val2 = pairs[-2]
+        # 2) Importe: token money anterior al saldo
+        importe_val = None
+        if saldo_idx is not None:
+            for j in range(saldo_idx - 1, -1, -1):
+                tok, val, kind = tail[j]
+                if kind == "money":
+                    importe_val = val
+                    break
 
-            # patrón principal: REF + IMPORTE + SALDO
-            if looks_like_ref_token(tok3):
-                cur_ref = re.sub(r"[^\d]", "", tok3)
-                cur_importe = val2
-            # patrón alternativo: IMPORTE + REF + SALDO (OCR raro)
-            elif looks_like_ref_token(tok2):
-                cur_ref = re.sub(r"[^\d]", "", tok2)
-                # en este caso no confiamos en importe (porque tok2 era ref)
-                # pero si querés, podés intentar usar val3 como importe:
-                cur_importe = val3
-            else:
-                # fallback: tomamos penúltimo como importe
-                cur_importe = val2
+        # 3) Referencia: token ref más cercano al final
+        ref_val = None
+        for i in range(len(tail) - 1, -1, -1):
+            tok, val, kind = tail[i]
+            if kind == "ref":
+                ref_val = re.sub(r"[^\d]", "", tok)
+                break
 
-        elif len(pairs) == 1:
-            # Solo saldo o solo importe: priorizamos SALDO (tu requisito)
-            # Ya lo setea el bloque len>=1 (cur_saldo = ...)
+        # Aplicamos lo encontrado (sin pisar si ya estaba seteado por líneas previas)
+        if ref_val is not None:
+            cur_ref = ref_val
+
+        # saldo: solo si encontramos un money plausible
+        if saldo_val is not None:
+            cur_saldo = saldo_val
+
+        # importe: si encontramos
+        if importe_val is not None:
+            cur_importe = importe_val
+        else:
+            # Caso “REF + SALDO” (sin importe en esa línea) => dejamos importe None
             pass
 
     flush_current()
@@ -535,4 +552,5 @@ with col_right:
                 use_container_width=True,
                 hide_index=True
             )
+
 
