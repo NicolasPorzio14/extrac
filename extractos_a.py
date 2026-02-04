@@ -39,47 +39,61 @@ def _clean_ocr_weird_chars(s: str) -> str:
         s = s.replace(k, v)
     return s
 
-
 def parse_ar_number(token: str) -> Optional[float]:
+    """
+    Parser robusto para OCR:
+    - 1.234,56 / 1234,56
+    - 1,234.56 / 1234.56
+    - 1.648.32  (OCR: miles con puntos + decimal con punto)
+    - -155.642.50 (OCR)
+    """
     t = token.strip()
     if not t:
         return None
-
     if not re.fullmatch(r"[-+]?\d[\d\.,]*", t):
         return None
 
     sign = -1.0 if t.startswith("-") else 1.0
     t2 = t.lstrip("+-")
 
-    # OCR a veces mete miles con varios puntos: 1.234.567 => quitar puntos
-    if "," not in t2 and t2.count(".") > 1:
-        t2 = t2.replace(".", "")
-    if "." not in t2 and t2.count(",") > 1:
-        t2 = t2.replace(",", "")
+    # Caso OCR: múltiples puntos y el último grupo tiene 2 dígitos => último punto es decimal
+    if "." in t2 and t2.count(".") >= 2 and "," not in t2:
+        parts = t2.split(".")
+        if len(parts[-1]) == 2 and all(p.isdigit() for p in parts):
+            # miles = todo menos el último, decimal = último
+            t2 = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            # si no cumple, asumimos que son miles
+            t2 = t2.replace(".", "")
 
+    # Caso OCR: múltiples comas y el último grupo tiene 2 dígitos => último es decimal
+    if "," in t2 and t2.count(",") >= 2 and "." not in t2:
+        parts = t2.split(",")
+        if len(parts[-1]) == 2 and all(p.isdigit() for p in parts):
+            t2 = "".join(parts[:-1]) + "." + parts[-1]
+        else:
+            t2 = t2.replace(",", "")
+
+    # Mixtos coma+punto: decide por el último separador
     if "," in t2 and "." in t2:
         last_comma = t2.rfind(",")
         last_dot = t2.rfind(".")
         if last_comma > last_dot:
-            # decimal ','
+            # decimal = ','
             t2 = t2.replace(".", "")
             t2 = t2.replace(",", ".")
         else:
-            # decimal '.'
+            # decimal = '.'
             t2 = t2.replace(",", "")
     elif "," in t2:
-        # decimal ','
+        # decimal = ','
         t2 = t2.replace(".", "")
         t2 = t2.replace(",", ".")
-    else:
-        # solo '.' o ninguno
-        pass
 
     try:
         return sign * float(t2)
     except ValueError:
         return None
-
 
 DATE_RE = re.compile(r"^(?P<d>\d{2}/\d{2}/\d{2})\b")
 NUMBER_TOKEN_RE = re.compile(r"[-+]?\d[\d\.,]*$")
@@ -121,9 +135,12 @@ def is_header_noise(line: str) -> bool:
     return any(x in l for x in noisy)
 
 
-def _extract_tail_numbers(line: str) -> Tuple[List[float], str]:
+def _extract_tail_numbers_with_tokens(line: str) -> Tuple[List[Tuple[str, float]], str]:
+    """
+    Devuelve lista de pares (token_original, valor_float) extraídos desde el final.
+    """
     parts = line.strip().split()
-    nums: List[float] = []
+    out: List[Tuple[str, float]] = []
 
     while parts:
         tok = parts[-1]
@@ -132,13 +149,12 @@ def _extract_tail_numbers(line: str) -> Tuple[List[float], str]:
         val = parse_ar_number(tok)
         if val is None:
             break
-        nums.append(val)
+        out.append((tok, val))
         parts.pop()
 
-    nums.reverse()
+    out.reverse()
     rest = " ".join(parts).strip()
-    return nums, rest
-
+    return out, rest
 
 # =========================================================
 # Modelo
@@ -165,6 +181,17 @@ class Movimiento:
 # =========================================================
 
 def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
+    """
+    Parser robusto:
+    - Detecta inicio de movimiento por fecha DD/MM/YY.
+    - Extrae números del final de la línea.
+    - Interpreta cola numérica como:
+        * ... IMPORTE SALDO
+        * ... REF SALDO
+        * ... REF IMPORTE SALDO
+      donde REF es un entero largo (8–14 dígitos) sin separadores.
+    - Si el OCR parte el movimiento en varias líneas, acumula texto y completa cuando aparecen números.
+    """
     raw_lines = [_clean_ocr_weird_chars(x.rstrip("\n")) for x in text.splitlines()]
 
     movimientos: List[Movimiento] = []
@@ -194,6 +221,32 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
         cur_importe = None
         cur_saldo = None
 
+    def looks_like_ref_token(tok: str) -> bool:
+        # referencia típica: 8 a 14 dígitos puros (sin comas/puntos), o sea "0970300052"
+        raw = re.sub(r"[^\d]", "", tok)
+        return raw.isdigit() and 8 <= len(raw) <= 14 and ("," not in tok) and ("." not in tok)
+
+    def extract_tail_pairs(line: str) -> Tuple[List[Tuple[str, float]], str]:
+        """
+        Igual que _extract_tail_numbers, pero devuelve token crudo + float.
+        """
+        parts = line.strip().split()
+        out: List[Tuple[str, float]] = []
+
+        while parts:
+            tok = parts[-1]
+            if not NUMBER_TOKEN_RE.fullmatch(tok):
+                break
+            val = parse_ar_number(tok)
+            if val is None:
+                break
+            out.append((tok, val))
+            parts.pop()
+
+        out.reverse()
+        rest_ = " ".join(parts).strip()
+        return out, rest_
+
     for line in raw_lines:
         line = line.strip()
         if not line or is_header_noise(line):
@@ -206,39 +259,70 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
             cur_fecha = dt
             line = DATE_RE.sub("", line, count=1).strip()
 
-        nums, rest = _extract_tail_numbers(line)
+        # Extrae pares (token, valor) al final
+        pairs, rest = extract_tail_pairs(line)
 
-        # referencia (bloque numérico largo al final del texto "rest")
+        # 1) Referencia desde el texto (si termina en bloque largo)
+        #    (Esto captura casos tipo: "Comision ... 0970300052 17,286.00 173,635.58"
+        #     donde la ref queda en rest si no fue tomada como número por el parser)
         ref_match = re.search(r"\b(\d{8,14})\b$", rest)
-        if ref_match:
+        if ref_match and cur_ref is None:
             cur_ref = ref_match.group(1)
             rest = rest[: ref_match.start(1)].strip()
 
         if rest:
             cur_text_parts.append(rest)
 
-        # Regla: si hay >=2 números al final, tomamos (importe, saldo) como los dos últimos.
-        # Si hay 1 número, priorizamos SALDO (tu requisito), salvo que ya tengamos saldo.
-        if len(nums) >= 2:
-            cur_importe = nums[-2]
-            cur_saldo = nums[-1]
-        elif len(nums) == 1:
-            if cur_saldo is None:
-                cur_saldo = nums[0]
-            elif cur_importe is None:
-                cur_importe = nums[0]
+        # 2) Interpretación de la cola numérica (desde derecha)
+        #    último = saldo
+        #    penúltimo = importe o referencia
+        #    antepenúltimo = referencia (si existe)
+        if len(pairs) >= 1:
+            tok_saldo, val_saldo = pairs[-1]
+            cur_saldo = val_saldo
+
+        if len(pairs) == 2:
+            tok2, val2 = pairs[-2]
+
+            if looks_like_ref_token(tok2):
+                # REF + SALDO (no hay importe en esta línea)
+                cur_ref = re.sub(r"[^\d]", "", tok2)
+                # no seteamos cur_importe acá
             else:
-                # si ya hay ambos, ignoramos (ruido)
-                pass
+                # IMPORTE + SALDO
+                cur_importe = val2
+
+        elif len(pairs) >= 3:
+            tok3, val3 = pairs[-3]
+            tok2, val2 = pairs[-2]
+
+            # patrón principal: REF + IMPORTE + SALDO
+            if looks_like_ref_token(tok3):
+                cur_ref = re.sub(r"[^\d]", "", tok3)
+                cur_importe = val2
+            # patrón alternativo: IMPORTE + REF + SALDO (OCR raro)
+            elif looks_like_ref_token(tok2):
+                cur_ref = re.sub(r"[^\d]", "", tok2)
+                # en este caso no confiamos en importe (porque tok2 era ref)
+                # pero si querés, podés intentar usar val3 como importe:
+                cur_importe = val3
+            else:
+                # fallback: tomamos penúltimo como importe
+                cur_importe = val2
+
+        elif len(pairs) == 1:
+            # Solo saldo o solo importe: priorizamos SALDO (tu requisito)
+            # Ya lo setea el bloque len>=1 (cur_saldo = ...)
+            pass
 
     flush_current()
 
-    # Limpieza: quedarnos con filas que tengan algo útil
     movimientos = [
         m for m in movimientos
         if (m.fecha is not None or m.concepto) and (m.saldo is not None or m.importe is not None)
     ]
     return movimientos
+
 
 
 # =========================================================
@@ -451,3 +535,4 @@ with col_right:
                 use_container_width=True,
                 hide_index=True
             )
+
