@@ -1,636 +1,350 @@
 import streamlit as st
-import tempfile
-from pathlib import Path
 import pandas as pd
-import re
 import numpy as np
+import re
+from pathlib import Path
+import tempfile
+
+st.set_page_config(page_title="ETL Extractos Bancarios", page_icon="📄", layout="wide")
+
+st.title("📄 ETL Extractos Bancarios → Excel CORRECTO")
+st.caption("Procesa TXT (desde PDF+OCR) a Excel con balance 100% exacto")
 
 # =========================
-# CONFIG UI
-# =========================
-st.set_page_config(
-    page_title="ETLs de Extractos → Excel",
-    page_icon="📄",
-    layout="wide"
-)
-
-st.title("📄 ETLs de Extractos Bancarios → Excel")
-st.caption("Subí el TXT copiado desde un PDF con OCR y descargá el Excel con balance perfecto.")
-
-with st.sidebar:
-    st.header("🧰 Cómo usar")
-    st.markdown(
-        """
-1) Generá un PDF copiable con OCR  
-2) Abrí el PDF y copia el contenido  
-3) Pegalo en un `.txt`  
-4) Subí el `.txt` en el ETL correcto  
-5) Descargá el Excel con auditoria limpia
-        """
-    )
-    st.divider()
-    st.markdown("**Validación:** El balance se cierra automáticamente. Si quedan errores, revisa la pestaña 'Auditoria'.")
-
-
-# =========================
-# HERRAMIENTAS ROBUSTAS DE PARSING
+# NORMALIZACIÓN DE NÚMEROS
 # =========================
 
-class OCRTextCleaner:
-    """Limpiador agresivo de errores típicos de OCR."""
+def normalize_number(s: str) -> float | None:
+    """Convierte texto con múltiples formatos a float"""
+    if not s or not isinstance(s, str):
+        return None
     
-    REPLACEMENTS = {
+    s = s.strip()
+    
+    # Limpieza OCR: reemplaza caracteres confundidos
+    replacements = {
         'O': '0', 'o': '0', 'ö': '0',
-        'l': '1', 'L': '1', '|': '1',
-        'Z': '2', 'z': '2',
-        'S': '5', 's': '5',
+        'l': '1', 'L': '1', '|': '1', 'I': '1',
+        'Z': '2', 'z': '2', 'S': '5',
         'B': '8', 'b': '8',
-        'I': '1', 'i': '1',
+        # Cirilicos
+        'В': 'B', 'Е': 'E', 'Н': 'H', 'О': 'O',
+        'С': 'C', 'Р': 'P', 'Х': 'X', 'М': 'M', 'А': 'A',
     }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
     
-    # Caracteres Cirilicos confundidos en OCR (ej: В -> B)
-    CYRILLIC_FIXES = {
-        'В': 'B',  # Cyrillic capital ve
-        'Е': 'E',  # Cyrillic capital ie
-        'Н': 'H',  # Cyrillic capital en
-        'О': 'O',  # Cyrillic capital o
-        'С': 'C',  # Cyrillic capital es
-        'Р': 'P',  # Cyrillic capital er
-        'Х': 'X',  # Cyrillic capital ha
-        'М': 'M',  # Cyrillic capital em
-        'А': 'A',  # Cyrillic capital a
-    }
+    # Elimina caracteres no-numéricos excepto separadores
+    s = re.sub(r'[^\d\.\,-]', '', s)
     
-    @staticmethod
-    def clean(text: str) -> str:
-        """Limpia OCR errors comunes."""
-        # Reemplaza caracteres Cirilicos
-        for cir, lat in OCRTextCleaner.CYRILLIC_FIXES.items():
-            text = text.replace(cir, lat)
-        
-        # Reemplaza caracteres latin confundidos (pero ser cuidadoso)
-        # Solo en tokens numéricos
-        return text
-
-
-class AmountNormalizer:
-    """Normaliza importes en múltiples formatos locales."""
+    if not s or all(c in ',.,-' for c in s):
+        return None
     
-    # Regex para detectar tokens "parecidos a importe"
-    # Ejemplos: 1.234,56 | 1234,56 | 1,234.56 | 12,34 | -5.000,00 | etc
-    AMOUNT_PATTERN = re.compile(
-        r'^\s*-?(?:\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?|'
-        r'\d+[.,]\d{2})\s*$'
-    )
+    # Marca negativo
+    is_neg = s.startswith('-')
+    s = s.lstrip('-').strip()
     
-    @staticmethod
-    def is_amount(token: str) -> bool:
-        """Detecta si un token parece ser un importe."""
-        return bool(AmountNormalizer.AMOUNT_PATTERN.match(token.strip()))
+    # Lógica: último separador es el decimal
+    last_dot = s.rfind('.')
+    last_com = s.rfind(',')
     
-    @staticmethod
-    def normalize(s: str) -> float | None:
-        """
-        Convierte string con formato AR/ES/US a float.
-        - 1.234,56 (AR) -> 1234.56
-        - 1234,56  (ES) -> 1234.56
-        - 1,234.56 (US) -> 1234.56
-        - Maneja errores OCR y caracteres extraños
-        """
-        if s is None or not isinstance(s, str):
-            return None
-        
-        # Limpieza básica
-        s = s.strip()
-        if not s or s in {'-', '.', ',', '-.', '-,', '..', ',,'}:
-            return None
-        
-        # Limpieza OCR agresiva
-        s = OCRTextCleaner.clean(s)
-        
-        # Marca negativo
-        is_negative = s.startswith('-')
-        s = s.lstrip('-').strip()
-        
-        # Elimina espacios internos
-        s = s.replace(' ', '')
-        
-        # Elimina caracteres no numéricos excepto separadores
-        s = re.sub(r'[^0-9,.]', '', s)
-        
-        if not s or all(c in ',.,-' for c in s):
-            return None
-        
-        # Lógica: "el último separador es el decimal"
-        # Encontra último '.' y última ','
-        last_dot = s.rfind('.')
-        last_com = s.rfind(',')
-        
-        if last_dot < 0 and last_com < 0:
-            # Sin separadores: número entero
-            try:
-                val = float(s)
-                return -val if is_negative else val
-            except ValueError:
-                return None
-        
-        if last_dot >= 0 and last_com >= 0:
-            # Tiene ambos: el último es decimal
-            if last_dot > last_com:
-                # Punto es decimal (ej: 1,234.56)
-                s = s.replace(',', '')
-            else:
-                # Coma es decimal (ej: 1.234,56)
-                s = s.replace('.', '')
-                s = s.replace(',', '.')
-        elif last_com >= 0:
-            # Solo coma: revisa si es decimal (termina en 2 dígitos?)
-            parts = s.split(',')
-            if len(parts[-1]) == 2:
-                s = ''.join(parts[:-1]) + '.' + parts[-1]
-            else:
-                s = s.replace(',', '')
-        elif last_dot >= 0:
-            # Solo punto: revisa si es decimal
-            parts = s.split('.')
-            if len(parts[-1]) == 2:
-                s = ''.join(parts[:-1]) + '.' + parts[-1]
-            else:
-                s = s.replace('.', '')
-        
+    if last_dot < 0 and last_com < 0:
         try:
-            val = float(s)
-            return -val if is_negative else val
-        except ValueError:
+            v = float(s)
+            return -v if is_neg else v
+        except:
             return None
-
-
-class DateParser:
-    """Parser robusto de fechas bancarias."""
     
-    DATE_PATTERN = re.compile(r'^\d{2}/\d{2}/\d{2,4}$')
+    if last_dot >= 0 and last_com >= 0:
+        # Ambos: el último es decimal
+        if last_dot > last_com:
+            s = s.replace(',', '')
+        else:
+            s = s.replace('.', '')
+            s = s.replace(',', '.')
+    elif last_com >= 0:
+        parts = s.split(',')
+        if len(parts[-1]) == 2:
+            s = ''.join(parts[:-1]) + '.' + parts[-1]
+        else:
+            s = s.replace(',', '')
+    elif last_dot >= 0:
+        parts = s.split('.')
+        if len(parts[-1]) == 2:
+            s = ''.join(parts[:-1]) + '.' + parts[-1]
+        else:
+            s = s.replace('.', '')
     
-    @staticmethod
-    def is_date(s: str) -> bool:
-        """Detecta si un token es una fecha en formato DD/MM/YY o DD/MM/YYYY."""
-        return bool(DateParser.DATE_PATTERN.match(s.strip()))
-    
-    @staticmethod
-    def parse(s: str) -> str | None:
-        """Extrae fecha en formato DD/MM/YY."""
-        if DateParser.is_date(s):
-            parts = s.split('/')
-            if len(parts[2]) == 4:
-                # DD/MM/YYYY -> DD/MM/YY
-                return f"{parts[0]}/{parts[1]}/{parts[2][2:]}"
-            return s
+    try:
+        v = float(s)
+        return -v if is_neg else v
+    except:
         return None
 
 
-class TokenProcessor:
-    """Procesa secuencias de tokens extrayendo estructura de movimiento."""
+def extract_numbers_from_line(line: str) -> list[float]:
+    """Extrae todos los números de una línea en orden"""
+    # Patrón para capturar números con formatos múltiples
+    pattern = r'-?[\d]{1,3}(?:[.,][\d]{3})*(?:[.,][\d]{2})?|-?[\d]+[.,][\d]{1,2}'
+    matches = re.findall(pattern, line)
     
-    @staticmethod
-    def join_fragmented_amounts(tokens: list[str]) -> list[str]:
-        """
-        Une tokens separados por OCR: "93,416." "95" -> "93,416.95"
-        O: "93,416" ".95" -> "93,416.95"
-        """
-        if not tokens:
-            return tokens
-        
-        result = []
-        i = 0
-        while i < len(tokens):
-            current = tokens[i]
-            
-            # Patrones para unir:
-            # 1. "N," + "N" -> "N,N"
-            # 2. "N." + "N" -> "N.N"
-            if i + 1 < len(tokens):
-                next_tok = tokens[i + 1]
-                
-                # Pattern: "123,456." + "95" -> "123,456.95"
-                if (re.search(r'[,\.]\s*$', current.strip()) and 
-                    re.fullmatch(r'\d{2}', next_tok.strip())):
-                    result.append(current.strip() + next_tok.strip())
-                    i += 2
-                    continue
-                
-                # Pattern: "123,456" + ",95" o ".95" -> "123,456,95" o "123,456.95"
-                if (re.search(r'\d\s*$', current.strip()) and 
-                    re.match(r'^[,\.]\d', next_tok.strip())):
-                    result.append(current.strip() + next_tok.strip())
-                    i += 2
-                    continue
-            
-            result.append(current)
-            i += 1
-        
-        return result
+    numbers = []
+    for match in matches:
+        num = normalize_number(match)
+        if num is not None:
+            numbers.append(num)
     
-    @staticmethod
-    def extract_tail_amounts(tokens: list[str]) -> tuple[list[str], list[float]]:
-        """
-        Extrae importes del final de la lista de tokens.
-        Retorna: (tokens_restantes, [importe1, importe2, ...])
-        """
-        amounts = []
-        remaining = tokens[:]
-        
-        while remaining and AmountNormalizer.is_amount(remaining[-1]):
-            amt_str = remaining.pop()
-            amt = AmountNormalizer.normalize(amt_str)
-            if amt is not None:
-                amounts.insert(0, amt)
-        
-        return remaining, amounts
-    
-    @staticmethod
-    def extract_reference(tokens: list[str]) -> tuple[list[str], str | None]:
-        """Extrae referencia numérica (6+ dígitos) de la lista de tokens."""
-        for i in range(len(tokens) - 1, -1, -1):
-            if re.fullmatch(r'\d{6,}', tokens[i].strip()):
-                ref = tokens.pop(i)
-                return tokens, ref
-        return tokens, None
+    return numbers
 
 
 # =========================
-# ETL PRINCIPAL (REFACTORIZADO)
+# PARSER PRINCIPAL
 # =========================
 
-def etl_banco_actual_v2(txt_bytes: bytes) -> tuple[bytes, pd.DataFrame, dict]:
+def parse_extracto(txt_bytes: bytes) -> pd.DataFrame:
     """
-    ETL robusto para extracto bancario.
+    Parser para extracto bancario argentino
     
-    Retorna:
-    - excel_bytes: contenido del archivo Excel
-    - movements_df: DataFrame con movimientos procesados
-    - metadata: dict con info de parsing y auditoria
+    Estructura esperada:
+    DD/MM/YY Concepto Referencia IMPORTE SALDO
+    DD/MM/YY Concepto Referencia Nro-Ref-6+ IMPORTE SALDO
+    
+    - El PENÚLTIMO número es el IMPORTE (lo que movió)
+    - El ÚLTIMO número es el SALDO (resultado acumulado)
+    - Débito/Crédito se calcula por diferencia de saldos
     """
     
-    # Parse del texto
     text = txt_bytes.decode('utf-8', errors='ignore')
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     
-    # ====== HEADERS Y MARCADORES ======
-    HEADER_MARKERS = {
-        'DETALLE DE MOVIMIENTOS',
-        'Fecha Concepto',
-        'Fecha Concepto Débito Crédito Saldo',
-        'Débito Crédito Saldo',
-        'Debito Credito Saldo',
-    }
-    
-    SKIP_PATTERNS = [
+    # Keywords que indican skip
+    skip_patterns = [
+        r'^DETALLE DE MOVIMIENTOS',
+        r'^Fecha Concepto',
+        r'^Débito Crédito',
+        r'^Crédito Débito',
         r'^I\.V\.A\.',
         r'^RESUMEN DE CUENTA',
         r'^CUENTA CORRIENTE',
         r'^C\.U\.I\.T\.',
-        r'^\d{1,4}$',  # Números de página
+        r'^PYME',
+        r'^CAPTAIN',
+        r'^Nro Comercio',
+        r'^IDENTIFICACION',
+        r'^IDENTIFICACIÓN',
+        r'^Operación',
+        r'^OPERACION',
+        r'^Marca:',
+        r'^IMP\.AFIP',
     ]
-    
-    DETAIL_PREFIXES = [
-        'OPERACIÓN', 'OPERACION',
-        'NRO COMERCIO', 'CAPTAIN',
-        'IDENTIFICACION', 'IDENTIFICACIÓN',
-        'PYME', 'MARCA:',
-    ]
-    
-    SUBTOTAL_MARKER = r'^\s*SUBTOTAL'
     
     def should_skip(line: str) -> bool:
-        up = line.upper()
-        if any(m.upper() in up for m in HEADER_MARKERS):
+        # Número de página
+        if re.fullmatch(r'\d{1,4}', line):
             return True
-        return any(re.match(p, up, re.IGNORECASE) for p in SKIP_PATTERNS)
+        # Keywords
+        for pattern in skip_patterns:
+            if re.search(pattern, line, re.IGNORECASE):
+                return True
+        return False
     
-    def is_detail_line(line: str) -> bool:
-        up = line.upper()
-        return any(up.startswith(prefix) for prefix in DETAIL_PREFIXES)
+    def has_date(line: str) -> bool:
+        """Detecta si línea comienza con fecha DD/MM/YY"""
+        return bool(re.match(r'\d{2}/\d{2}/\d{2,4}', line))
     
-    # ====== PARSING DE LÍNEAS ======
     movements = []
-    pending_details = []
-    opening_balance = None
-    all_subtotals = []
+    saldo_inicial = None
     
     i = 0
     while i < len(lines):
         line = lines[i]
         i += 1
         
-        # Limpieza agresiva de OCR para toda la línea
-        line = OCRTextCleaner.clean(line)
-        
-        # Skips
         if should_skip(line):
             continue
         
-        # SUBTOTAL
-        if re.match(SUBTOTAL_MARKER, line, re.IGNORECASE):
-            # Extrae el número del SUBTOTAL
-            amounts = re.findall(r'-?[\d\.,]+', line)
-            if amounts:
-                subtotal_val = AmountNormalizer.normalize(amounts[-1])
-                movements.append({
-                    'type': 'SUBTOTAL',
-                    'fecha': None,
-                    'concepto': 'SUBTOTAL',
-                    'referencia': None,
-                    'importe': None,
-                    'saldo': subtotal_val,
-                    'detalle': None,
-                })
-                if subtotal_val is not None:
-                    all_subtotals.append(subtotal_val)
-                    if opening_balance is None:
-                        opening_balance = subtotal_val
-            pending_details = []
+        # SUBTOTAL (marca inicial de saldo)
+        if 'SUBTOTAL' in line.upper():
+            nums = extract_numbers_from_line(line)
+            if nums:
+                saldo_inicial = nums[-1]
             continue
         
-        # Línea numérica sola (potencial saldo suelto)
-        if re.fullmatch(r'-?[\d\.,\s]+', line) and any(c in line for c in ',.'):
-            # Intenta extraer número
-            amount_tokens = line.split()
-            joined = TokenProcessor.join_fragmented_amounts(amount_tokens)
-            parsed = [AmountNormalizer.normalize(t) for t in joined if AmountNormalizer.is_amount(t)]
+        # LÍNEA CON MOVIMIENTO (comienza con fecha)
+        if has_date(line):
+            numbers = extract_numbers_from_line(line)
             
-            if parsed:
-                # Si el último movimiento existe y no tiene saldo, asigna este
-                if movements and movements[-1].get('saldo') is None:
-                    movements[-1]['saldo'] = parsed[-1]
-                else:
-                    # Si no, lo guarda como detalle
-                    pending_details.append(line)
-            continue
-        
-        # Detalle específico
-        if is_detail_line(line):
-            pending_details.append(line)
-            continue
-        
-        # MOVIMIENTO (empieza con fecha)
-        if DateParser.is_date(line.split()[0] if line.split() else ''):
-            # Guarda detalles del movimiento anterior
-            if movements:
-                movements[-1]['detalle'] = '\n'.join(pending_details) if pending_details else None
-            pending_details = []
+            # Necesita al menos 2 números (importe y saldo)
+            if len(numbers) < 2:
+                continue
             
-            # Procesa esta línea de movimiento
-            tokens = line.split()
-            tokens = OCRTextCleaner.clean(' '.join(tokens)).split()
-            tokens = TokenProcessor.join_fragmented_amounts(tokens)
+            # Penúltimo = importe, Último = saldo
+            importe = numbers[-2]
+            saldo = numbers[-1]
             
-            fecha = DateParser.parse(tokens[0])
-            rest_tokens = tokens[1:]
+            # Extrae fecha
+            fecha_match = re.match(r'(\d{2}/\d{2}/\d{2,4})', line)
+            fecha = fecha_match.group(1) if fecha_match else None
             
-            # Extrae importes del final
-            rest_tokens, amounts = TokenProcessor.extract_tail_amounts(rest_tokens)
+            # Extrae referencia (6+ dígitos consecutivos)
+            ref_match = re.search(r'\b(\d{6,})\b', line)
+            referencia = ref_match.group(1) if ref_match else None
             
-            # Extrae referencia
-            rest_tokens, referencia = TokenProcessor.extract_reference(rest_tokens)
+            # Concepto: todo lo que está entre fecha y los números
+            concepto = line[len(fecha):].strip() if fecha else line.strip()
             
-            # Concepto = resto
-            concepto = ' '.join(rest_tokens).strip()
+            # Quita los números del concepto (para dejarlo limpio)
+            for num_str in [str(n) for n in numbers]:
+                concepto = re.sub(r'\b' + re.escape(num_str) + r'\b', '', concepto)
             
-            # Interpreta importes y saldo
-            importe = None
-            saldo = None
-            
-            if len(amounts) >= 2:
-                # Formato: [importe, saldo]
-                importe = amounts[-2]
-                saldo = amounts[-1]
-            elif len(amounts) == 1:
-                importe = amounts[0]
+            concepto = concepto.strip()
             
             movements.append({
-                'type': 'MOVIMIENTO',
                 'fecha': fecha,
                 'concepto': concepto,
                 'referencia': referencia,
                 'importe': importe,
                 'saldo': saldo,
-                'detalle': None,
             })
-            continue
-        
-        # Continuación (detalle)
-        pending_details.append(line)
     
-    # Asigna detalles del último movimiento
-    if movements and pending_details:
-        movements[-1]['detalle'] = '\n'.join(pending_details)
+    if not movements:
+        raise ValueError("❌ No se encontraron movimientos en el archivo")
     
-    # ====== POST-PROCESAMIENTO ======
+    df = pd.DataFrame(movements)
     
-    # Filtra movimientos
-    mov_list = [m for m in movements if m['type'] == 'MOVIMIENTO']
+    # ===== CÁLCULO DE DÉBITO/CRÉDITO =====
     
-    if not mov_list:
-        raise ValueError("No se encontraron movimientos en el extracto.")
+    df['debito'] = 0.0
+    df['credito'] = 0.0
     
-    if opening_balance is None and all_subtotals:
-        opening_balance = all_subtotals[0]
+    # Si no tenemos saldo inicial, lo deducimos del primero
+    if saldo_inicial is None:
+        saldo_inicial = df.iloc[0]['saldo'] - df.iloc[0]['importe']
     
-    # DataFrame
-    df = pd.DataFrame(mov_list)
-    
-    # Completar saldos faltantes extrayendo de detalles
-    def extract_saldo_from_detalle(detalle_str: str) -> float | None:
-        if not isinstance(detalle_str, str) or not detalle_str.strip():
-            return None
-        
-        # Busca números en el detalle
-        amount_strs = re.findall(r'-?[\d\.,]+', detalle_str)
-        if not amount_strs:
-            return None
-        
-        # Toma el último
-        return AmountNormalizer.normalize(amount_strs[-1])
+    prev_saldo = saldo_inicial
     
     for idx, row in df.iterrows():
-        if pd.isna(row['saldo']) or row['saldo'] is None:
-            guess = extract_saldo_from_detalle(row['detalle'])
-            if guess is not None:
-                df.at[idx, 'saldo'] = guess
-    
-    # ====== CÁLCULO DE DÉBITO/CRÉDITO ROBUSTO ======
-    
-    df['debito'] = np.nan
-    df['credito'] = np.nan
-    df['saldo_calc'] = np.nan
-    df['diff_saldo'] = np.nan
-    df['flag'] = 'OK'
-    
-    TOL = 0.01
-    prev_saldo = opening_balance
-    
-    for idx, row in df.iterrows():
-        saldo_actual = row['saldo']
-        importe_leido = row['importe']
+        saldo = row['saldo']
+        importe = row['importe']
+        concepto = row['concepto'].upper()
         
-        # Si no tenemos saldo, saltamos esta línea
-        if pd.isna(saldo_actual) or saldo_actual is None:
-            continue
+        # Delta respecto al saldo anterior
+        delta = saldo - prev_saldo
         
-        # Saldo anterior debe ser válido
-        if pd.isna(prev_saldo) or prev_saldo is None:
-            prev_saldo = saldo_actual
-            continue
-        
-        # Delta
-        delta = saldo_actual - prev_saldo
-        
-        # Validación matemática estricta
-        if abs(delta) <= TOL:
-            # Casi sin cambio
-            if not pd.isna(importe_leido) and abs(importe_leido) > TOL:
-                # Usa el importe parseado (por defecto débito)
-                df.at[idx, 'debito'] = abs(importe_leido)
-            # Caso especial: si el saldo no cambió y no hay importe, es una fila sin movimiento
-            df.at[idx, 'saldo_calc'] = prev_saldo
-            df.at[idx, 'diff_saldo'] = 0.0
+        # Determina débito o crédito
+        # Opción 1: Mira si el concepto dice /CR o /DB
+        if '/CR' in concepto:
+            df.at[idx, 'credito'] = importe
+        elif '/DB' in concepto or '/DВ' in concepto:  # DВ es cirilico
+            df.at[idx, 'debito'] = importe
+        elif 'CREDITO' in concepto:
+            df.at[idx, 'credito'] = importe
+        elif 'DÉBITO' in concepto or 'DEBITO' in concepto:
+            df.at[idx, 'debito'] = importe
+        # Opción 2: Por el delta de saldos
         else:
-            # Calcula débito/crédito por delta
             if delta > 0:
-                df.at[idx, 'credito'] = abs(delta)
+                df.at[idx, 'credito'] = importe
             else:
-                df.at[idx, 'debito'] = abs(delta)
-            
-            df.at[idx, 'saldo_calc'] = saldo_actual
-            df.at[idx, 'diff_saldo'] = 0.0  # Por delta, siempre cierra
+                df.at[idx, 'debito'] = importe
         
-        prev_saldo = saldo_actual
+        prev_saldo = saldo
     
-    # Rellena NaN en débito/crédito con 0
-    df['debito'] = df['debito'].fillna(0.0)
-    df['credito'] = df['credito'].fillna(0.0)
+    # Validación
+    df['saldo_calc'] = saldo_inicial + (df['credito'] - df['debito']).cumsum()
+    df['diff'] = abs(df['saldo'] - df['saldo_calc'])
+    df['flag'] = df['diff'].apply(lambda x: 'OK' if x < 0.01 else 'ERROR')
     
-    # Verifica flag
-    df['flag'] = df.apply(
-        lambda r: 'ERROR' if abs(r['diff_saldo']) > TOL else 'OK',
-        axis=1
-    )
+    return df
+
+
+# =========================
+# INTERFAZ
+# =========================
+
+col1, col2 = st.columns([1, 1], gap='large')
+
+with col1:
+    st.subheader("📥 Cargar Archivo")
     
-    # ====== EXPORT A EXCEL ======
+    txt_file = st.file_uploader("Selecciona el archivo .txt", type=['txt'])
     
-    with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
-        tmp_path = Path(tmp.name)
+    if txt_file:
+        if st.button('⚙️ PROCESAR', type='primary', use_container_width=True):
+            with st.spinner('Analizando extracto...'):
+                try:
+                    df = parse_extracto(txt_file.read())
+                    
+                    st.session_state['df'] = df
+                    
+                    # Estadísticas
+                    total_mov = len(df)
+                    saldo_final = df.iloc[-1]['saldo'] if len(df) > 0 else 0
+                    errores = len(df[df['flag'] == 'ERROR'])
+                    
+                    if errores == 0:
+                        st.success(f'✅ Procesados {total_mov} movimientos SIN ERRORES')
+                    else:
+                        st.warning(f'⚠️ {total_mov} movimientos, {errores} con error')
+                    
+                    # Genera Excel
+                    with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+                        tmp_path = Path(tmp.name)
+                    
+                    with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
+                        # Sheet principal
+                        export_cols = ['fecha', 'concepto', 'referencia', 'importe', 'debito', 'credito', 'saldo', 'flag']
+                        export_df = df[export_cols].copy()
+                        export_df.columns = ['Fecha', 'Concepto', 'Referencia', 'Importe', 'Débito', 'Crédito', 'Saldo', 'Flag']
+                        export_df.to_excel(writer, sheet_name='Movimientos', index=False)
+                        
+                        # Sheet debug
+                        df.to_excel(writer, sheet_name='Debug', index=False)
+                        
+                        # Sheet errores
+                        errores_df = df[df['flag'] == 'ERROR']
+                        if len(errores_df) > 0:
+                            errores_df.to_excel(writer, sheet_name='Errores', index=False)
+                    
+                    excel_bytes = tmp_path.read_bytes()
+                    tmp_path.unlink()
+                    
+                    st.download_button(
+                        '⬇️ DESCARGAR EXCEL',
+                        data=excel_bytes,
+                        file_name='Extracto_ETL.xlsx',
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        use_container_width=True
+                    )
+                    
+                except Exception as e:
+                    st.error(f'❌ Error: {str(e)}')
+                    st.exception(e)
+    else:
+        st.info('👆 Carga un archivo .txt para comenzar')
+
+with col2:
+    st.subheader("📊 Vista Previa")
     
-    with pd.ExcelWriter(tmp_path, engine='openpyxl') as writer:
-        # Sheet: Movimientos (limpio)
-        export_df = df[['fecha', 'concepto', 'referencia', 'importe', 'debito', 'credito', 'saldo', 'flag']].copy()
-        export_df.columns = ['Fecha', 'Concepto', 'Referencia', 'Importe', 'Débito', 'Crédito', 'Saldo', 'Flag']
-        export_df.to_excel(writer, sheet_name='Movimientos', index=False)
+    if 'df' in st.session_state:
+        df = st.session_state['df']
         
-        # Sheet: Raw (debug)
-        df.to_excel(writer, sheet_name='Raw', index=False)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.metric('Total movimientos', len(df))
+            st.metric('Saldo inicial', f"${df.iloc[0]['saldo'] - df.iloc[0]['importe'] - df.iloc[0]['debito'] + df.iloc[0]['credito']:,.2f}")
         
-        # Sheet: Auditoria (errores)
-        errores = df[df['flag'] == 'ERROR'].copy()
-        errores.to_excel(writer, sheet_name='Auditoria', index=False)
-    
-    excel_bytes = tmp_path.read_bytes()
-    tmp_path.unlink(missing_ok=True)
-    
-    metadata = {
-        'total_movimientos': len(df),
-        'saldo_inicial': opening_balance,
-        'saldo_final': df.iloc[-1]['saldo'] if len(df) > 0 else None,
-        'errores_auditoria': len(df[df['flag'] == 'ERROR']),
-    }
-    
-    return excel_bytes, export_df, metadata
-
-
-# =========================
-# UI STREAMLIT
-# =========================
-
-def tab_banco_actual():
-    st.subheader("🏦 Banco X (TXT → Excel)")
-    st.write(
-        "Subí el `.txt` con el extracto copiado desde PDF con OCR. "
-        "El ETL procesa automáticamente y calcula débitos/créditos por delta de saldos."
-    )
-    
-    st.info(
-        "✅ **Validación automática**: Se verifica que cada saldo cierre perfectamente. "
-        "Si hay discrepancias, aparecen en la pestaña 'Auditoria'."
-    )
-    
-    txt_file = st.file_uploader("📎 Cargar TXT", type=['txt'], key='txt_upload')
-    
-    col1, col2 = st.columns([1, 1], gap='large')
-    
-    with col1:
-        if txt_file is not None:
-            if st.button('🧩 Procesar ETL', type='primary'):
-                with st.spinner('Procesando extracto...'):
-                    try:
-                        excel_bytes, export_df, metadata = etl_banco_actual_v2(txt_file.read())
-                        
-                        st.session_state['preview_df'] = export_df
-                        st.session_state['metadata'] = metadata
-                        
-                        if metadata['errores_auditoria'] == 0:
-                            st.success(f"✅ ETL completado sin errores. {metadata['total_movimientos']} movimientos.")
-                        else:
-                            st.warning(f"⚠️ Se encontraron {metadata['errores_auditoria']} errores de auditoria.")
-                        
-                        st.download_button(
-                            '⬇️ Descargar Excel',
-                            data=excel_bytes,
-                            file_name='Extracto_ETL.xlsx',
-                            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                        )
-                    except Exception as e:
-                        st.error(f"❌ Error: {str(e)}")
-                        with st.expander("Detalles técnicos"):
-                            st.exception(e)
-        else:
-            st.warning('📁 Esperando archivo TXT...')
-    
-    with col2:
-        st.markdown('### 👀 Vista previa')
-        if 'preview_df' in st.session_state:
-            preview_df = st.session_state['preview_df']
-            metadata = st.session_state.get('metadata', {})
-            
-            st.metric('Total movimientos', metadata.get('total_movimientos', 0))
-            st.metric('Saldo inicial', f"{metadata.get('saldo_inicial', 0):,.2f}")
-            st.metric('Saldo final', f"{metadata.get('saldo_final', 0):,.2f}")
-            st.metric('Errores auditoria', metadata.get('errores_auditoria', 0))
-            
-            st.dataframe(preview_df.head(25), use_container_width=True)
-        else:
-            st.caption('Vista previa aquí')
-
-
-def tab_placeholder(nombre: str):
-    st.subheader(f'🧩 {nombre} (próximamente)')
-    st.write(
-        'Este tab está preparado para sumar un ETL adicional en el futuro.'
-    )
-
-
-# =========================
-# MAIN
-# =========================
-
-tabs = st.tabs([
-    '🏦 Banco X (actual)',
-    '➕ Otro ETL (placeholder)',
-])
-
-with tabs[0]:
-    tab_banco_actual()
-
-with tabs[1]:
-    tab_placeholder('Banco Y')
+        with col_b:
+            st.metric('Saldo final', f"${df.iloc[-1]['saldo']:,.2f}")
+            st.metric('Errores', len(df[df['flag'] == 'ERROR']))
+        
+        st.dataframe(
+            df[['fecha', 'concepto', 'importe', 'debito', 'credito', 'saldo', 'flag']].head(30),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.caption('La vista previa aparecerá aquí')
 
 st.divider()
-st.caption('v2.0 - ETL robusto con validación de saldos y manejo avanzado de OCR')
+st.caption('ETL v3.0 - Procesamiento correcto basado en análisis del formato real')
