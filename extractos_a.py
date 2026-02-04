@@ -68,6 +68,69 @@ def _clean_ocr_weird_chars(s: str) -> str:
     s = re.sub(r"(\d)[oO](\b|$)", r"\g<1>0\2", s)
     return s
 
+def repair_shift_importes(movs: List[Movimiento], tol: float = 0.01) -> List[Movimiento]:
+    """
+    Repara desfasajes típicos OCR/TXT donde el importe quedó en la fila de arriba/abajo.
+    Regla:
+      - expected_i = abs(saldo_i - saldo_{i-1})
+      - si importe_i no coincide con expected_i pero coincide con expected_{i+1} => mover abajo
+      - si importe_i no coincide con expected_i pero coincide con expected_{i-1} => mover arriba
+    Solo mueve si el destino está vacío o también está mal.
+    """
+
+    def close(a: Optional[float], b: Optional[float]) -> bool:
+        if a is None or b is None:
+            return False
+        return abs(abs(a) - abs(b)) <= max(tol, 0.01)
+
+    # expected deltas por saldo (la “verdad”)
+    expected = [None] * len(movs)
+    prev_saldo = None
+    for i, m in enumerate(movs):
+        if m.saldo is None:
+            expected[i] = None
+            continue
+        if prev_saldo is None:
+            expected[i] = None
+        else:
+            expected[i] = abs(m.saldo - prev_saldo)
+        prev_saldo = m.saldo
+
+    # 1) Shift hacia abajo (i -> i+1)
+    for i in range(1, len(movs) - 1):
+        mi = movs[i]
+        mj = movs[i + 1]
+
+        if mi.importe is None or expected[i] is None or expected[i + 1] is None:
+            continue
+
+        ok_i = close(mi.importe, expected[i])
+        ok_next = close(mi.importe, expected[i + 1])
+
+        # Si no encaja en su fila pero encaja perfecto en la siguiente:
+        if (not ok_i) and ok_next:
+            # Solo movemos si la siguiente está vacía o no encaja con su expected
+            if (mj.importe is None) or (expected[i + 1] is not None and not close(mj.importe, expected[i + 1])):
+                mj.importe = mi.importe
+                mi.importe = None
+
+    # 2) Shift hacia arriba (i -> i-1)
+    for i in range(2, len(movs)):
+        mi = movs[i]
+        mp = movs[i - 1]
+
+        if mi.importe is None or expected[i] is None or expected[i - 1] is None:
+            continue
+
+        ok_i = close(mi.importe, expected[i])
+        ok_prev = close(mi.importe, expected[i - 1])
+
+        if (not ok_i) and ok_prev:
+            if (mp.importe is None) or (expected[i - 1] is not None and not close(mp.importe, expected[i - 1])):
+                mp.importe = mi.importe
+                mi.importe = None
+
+    return movs
 
 def parse_ar_number(token: str) -> Optional[float]:
     """
@@ -570,6 +633,7 @@ with c2:
         txt = uploaded.getvalue().decode("utf-8", errors="ignore")
 
         movs = parse_movimientos_from_txt_text(txt)
+        movs = repair_shift_importes(movs, tol=float(tol))
         movs = audit_and_classify(movs, tol=float(tol))
 
         df_mov, df_aud = movimientos_to_dfs(movs)
@@ -614,4 +678,5 @@ with c2:
 
         with st.expander("Ver auditoría / flags (primeros 300)"):
             st.dataframe(df_aud.head(300), use_container_width=True, hide_index=True)
+
 
