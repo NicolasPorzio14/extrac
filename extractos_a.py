@@ -64,6 +64,21 @@ def _clean_ocr_weird_chars(s: str) -> str:
     s = re.sub(r"(\d)[oO](\b|$)", r"\g<1>0\2", s)
     return s
 
+def _is_balance_only_line(line: str) -> Optional[float]:
+    """
+    Si la línea es solamente un saldo (ej: '170,005.52' o '169.452,37'),
+    devuelve el float. Si no, None.
+    """
+    s = line.strip()
+    # A veces viene con un contador adelante: "13 93,416.95"
+    parts = s.split()
+    if len(parts) == 2 and _looks_like_page_number_only(parts[0]) and MONEY_TOKEN_RE.fullmatch(parts[1]):
+        s = parts[1]
+
+    if MONEY_TOKEN_RE.fullmatch(s):
+        return parse_ar_number(s)
+    return None
+
 
 def parse_ar_number(token: str) -> Optional[float]:
     """
@@ -239,25 +254,62 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
     raw_lines = [_clean_ocr_weird_chars(x.rstrip("\n")) for x in text.splitlines()]
     movimientos: List[Movimiento] = []
 
+    # movimiento “en armado”
     cur_fecha: Optional[datetime] = None
     cur_text_parts: List[str] = []
     cur_ref: Optional[str] = None
     cur_importe: Optional[float] = None
     cur_saldo: Optional[float] = None
 
-    def flush_current():
+    # COLA: movimientos pendientes de saldo (FIFO)
+    pending: List[Movimiento] = []
+
+    def flush_current_to_list_or_pending():
+        """
+        Cierra el movimiento actual:
+        - Si tiene saldo => a 'movimientos'
+        - Si NO tiene saldo pero tiene importe => a 'pending'
+        """
         nonlocal cur_fecha, cur_text_parts, cur_ref, cur_importe, cur_saldo
+
         concepto = " ".join([p for p in cur_text_parts if p]).strip()
-        if (cur_fecha is not None) and (concepto or cur_importe is not None or cur_saldo is not None):
-            movimientos.append(
-                Movimiento(
-                    fecha=cur_fecha,
-                    concepto=concepto,
-                    referencia=cur_ref,
-                    importe=cur_importe,
-                    saldo=cur_saldo,
-                )
-            )
+
+        if cur_fecha is None:
+            # nada para guardar
+            cur_text_parts = []
+            cur_ref = None
+            cur_importe = None
+            cur_saldo = None
+            return
+
+        # si no hay nada útil, lo descartamos
+        if not (concepto or cur_importe is not None or cur_saldo is not None):
+            cur_fecha = None
+            cur_text_parts = []
+            cur_ref = None
+            cur_importe = None
+            cur_saldo = None
+            return
+
+        m = Movimiento(
+            fecha=cur_fecha,
+            concepto=concepto,
+            referencia=cur_ref,
+            importe=cur_importe,
+            saldo=cur_saldo,
+        )
+
+        if m.saldo is not None:
+            movimientos.append(m)
+        else:
+            # sin saldo: si al menos hay importe, lo dejamos pendiente
+            if m.importe is not None:
+                pending.append(m)
+            else:
+                # sin importe y sin saldo: lo descartamos
+                pass
+
+        # reset
         cur_fecha = None
         cur_text_parts = []
         cur_ref = None
@@ -269,28 +321,42 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
         if not line or is_header_noise(line):
             continue
 
-        # Paginado solo: "179"
+        # Paginado puro (ej "179")
         if _looks_like_page_number_only(line):
             continue
 
-        # Caso "13 93,416.95" (contador + saldo)
-        parts2 = line.split()
-        if len(parts2) == 2 and _looks_like_page_number_only(parts2[0]) and MONEY_TOKEN_RE.fullmatch(parts2[1]):
-            line = parts2[1]
+        # 1) Si es una línea SOLO SALDO, se asigna al primer pendiente (FIFO)
+        bal = _is_balance_only_line(line)
+        if bal is not None:
+            if pending:
+                pending[0].saldo = bal
+                movimientos.append(pending.pop(0))
+            else:
+                # si no hay pendientes, lo ignoramos (o podrías loguearlo)
+                pass
+            continue
 
+        # 2) Si arranca con fecha => nuevo movimiento
         dt = parse_date(line)
         if dt is not None:
-            flush_current()
+            # antes de empezar uno nuevo, cerramos el actual (si había)
+            flush_current_to_list_or_pending()
             cur_fecha = dt
             line = DATE_RE.sub("", line, count=1).strip()
 
-        # Si todavía no comenzó un movimiento, ignoramos ruido
+        # Si todavía no hay movimiento activo, ignoramos
         if cur_fecha is None:
             continue
 
+        # 3) Extraer importe/saldo/ref de la cola numérica
         imp, sal, ref, rest = _extract_tail_money_and_ref(line)
 
-        # referencia desde rest si quedó ahí (sin estar en cola)
+        # En estos extractos "Operación XXXX Generada el ..." NO es movimiento,
+        # pero puede servir como metadata. Si querés ignorarlo, descomentá:
+        # if rest.upper().startswith("OPERACIÓN "):
+        #     continue
+
+        # ref desde rest si quedó ahí
         if cur_ref is None:
             mref = re.search(r"\b(\d{8,14})\b$", rest)
             if mref:
@@ -303,70 +369,25 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
         if rest:
             cur_text_parts.append(rest)
 
-        # saldo es lo más importante
-        if sal is not None and cur_saldo is None:
+        # saldo es lo más importante (pero OJO: si aparecen 2 moneys, sal=saldo; imp=importe)
+        if sal is not None:
             cur_saldo = sal
-        if imp is not None and cur_importe is None:
+        if imp is not None:
             cur_importe = imp
 
-    flush_current()
+        # Nota: NO hacemos flush acá; esperamos a que:
+        # - venga una nueva fecha (flush_current_to_list_or_pending)
+        # - o termine el archivo
+
+    # cierre final
+    flush_current_to_list_or_pending()
+
+    # Si quedaron pendientes sin saldo al final, los mandamos igual con saldo None
+    # (para que aparezcan en Auditoría como SIN_SALDO)
+    for m in pending:
+        movimientos.append(m)
+
     return movimientos
-
-
-def audit_and_classify(movs: List[Movimiento], tol: float = 0.01) -> List[Movimiento]:
-    prev_saldo: Optional[float] = None
-
-    for m in movs:
-        flags = []
-
-        if m.saldo is None:
-            flags.append("SIN_SALDO")
-            m.ok_auditoria = False
-            m.flags = ";".join(flags)
-            continue
-
-        if prev_saldo is None:
-            m.delta_saldo = None
-            if m.importe is None:
-                flags.append("PRIMERA_FILA_SIN_IMPORTE")
-            m.ok_auditoria = True
-            m.flags = ";".join(flags)
-            prev_saldo = m.saldo
-            continue
-
-        delta = m.saldo - prev_saldo
-        m.delta_saldo = delta
-
-        # Débito/Crédito por delta saldo
-        if abs(delta) <= tol:
-            m.debito = 0.0
-            m.credito = 0.0
-            flags.append("DELTA_CERO")
-        elif delta > 0:
-            m.credito = round(delta, 2)
-            m.debito = 0.0
-        else:
-            m.debito = round(-delta, 2)
-            m.credito = 0.0
-
-        # Auditoría de importe
-        if m.importe is None:
-            m.importe_inferido = round(abs(delta), 2)
-            flags.append("IMPORTE_INFERIDO_POR_SALDO")
-        else:
-            if abs(abs(delta) - abs(m.importe)) > max(tol, 0.01):
-                flags.append("IMPORTE_NO_COINCIDE_CON_DELTA_SALDO")
-
-        if m.importe is None and m.importe_inferido is None:
-            flags.append("SIN_IMPORTE")
-            m.ok_auditoria = False
-        else:
-            m.ok_auditoria = ("IMPORTE_NO_COINCIDE_CON_DELTA_SALDO" not in flags)
-
-        m.flags = ";".join(flags)
-        prev_saldo = m.saldo
-
-    return movs
 
 
 def movimientos_to_dfs(movs: List[Movimiento]) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -497,3 +518,4 @@ with c2:
 
         with st.expander("Ver auditoría / flags (primeros 300)"):
             st.dataframe(df_aud.head(300), use_container_width=True, hide_index=True)
+
