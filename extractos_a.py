@@ -5,12 +5,19 @@
 #   pip install streamlit pandas openpyxl
 #   streamlit run app.py
 #
-# Qué hace:
-# - Subís un .txt con el contenido copiado del PDF (OCR ya hecho).
-# - Parseo: fecha, concepto, referencia, importe, saldo.
-# - Débito/Crédito se clasifica por delta de saldo (regla principal).
-# - Auditoría: delta vs importe, filas sin importe, sin saldo, etc.
-# - Descargás un .xlsx con 2 hojas: Movimientos y Auditoría.
+# Notas del problema (OCR/TXT):
+# - Hay movimientos cuyo IMPORTE aparece en la línea con fecha, pero el SALDO aparece en una o más líneas
+#   siguientes “saldo-only” (ej: IVA / percepciones / cobros).
+# - A veces aparecen varios saldos “saldo-only” seguidos (uno por cada movimiento previo sin saldo).
+# - A veces el importe queda corrido a la fila de arriba/abajo.
+#
+# Estrategia:
+# 1) Parser con “pending queue” (FIFO): movimientos con importe pero sin saldo se encolan.
+#    Cuando aparece una línea “saldo-only”, se asigna primero al primer pending.
+#    Si no hay pending, se asigna al movimiento actual abierto (si corresponde).
+# 2) Si una línea (con fecha) trae un único token monetario, se interpreta como IMPORTE (no como saldo).
+# 3) Post-proceso: repair_shift_importes() para corregir corrimientos típicos de importe entre filas.
+# 4) Auditoría: valida abs(delta saldo) vs importe (o infiere importe si falta).
 
 from __future__ import annotations
 
@@ -25,7 +32,7 @@ import streamlit as st
 
 
 # =========================================================
-# Config UI
+# UI
 # =========================================================
 st.set_page_config(page_title="ETL Extracto → Excel", page_icon="📄", layout="wide")
 st.title("📄 ETL Extracto bancario (TXT OCR) → Excel")
@@ -68,69 +75,6 @@ def _clean_ocr_weird_chars(s: str) -> str:
     s = re.sub(r"(\d)[oO](\b|$)", r"\g<1>0\2", s)
     return s
 
-def repair_shift_importes(movs: List[Movimiento], tol: float = 0.01) -> List[Movimiento]:
-    """
-    Repara desfasajes típicos OCR/TXT donde el importe quedó en la fila de arriba/abajo.
-    Regla:
-      - expected_i = abs(saldo_i - saldo_{i-1})
-      - si importe_i no coincide con expected_i pero coincide con expected_{i+1} => mover abajo
-      - si importe_i no coincide con expected_i pero coincide con expected_{i-1} => mover arriba
-    Solo mueve si el destino está vacío o también está mal.
-    """
-
-    def close(a: Optional[float], b: Optional[float]) -> bool:
-        if a is None or b is None:
-            return False
-        return abs(abs(a) - abs(b)) <= max(tol, 0.01)
-
-    # expected deltas por saldo (la “verdad”)
-    expected = [None] * len(movs)
-    prev_saldo = None
-    for i, m in enumerate(movs):
-        if m.saldo is None:
-            expected[i] = None
-            continue
-        if prev_saldo is None:
-            expected[i] = None
-        else:
-            expected[i] = abs(m.saldo - prev_saldo)
-        prev_saldo = m.saldo
-
-    # 1) Shift hacia abajo (i -> i+1)
-    for i in range(1, len(movs) - 1):
-        mi = movs[i]
-        mj = movs[i + 1]
-
-        if mi.importe is None or expected[i] is None or expected[i + 1] is None:
-            continue
-
-        ok_i = close(mi.importe, expected[i])
-        ok_next = close(mi.importe, expected[i + 1])
-
-        # Si no encaja en su fila pero encaja perfecto en la siguiente:
-        if (not ok_i) and ok_next:
-            # Solo movemos si la siguiente está vacía o no encaja con su expected
-            if (mj.importe is None) or (expected[i + 1] is not None and not close(mj.importe, expected[i + 1])):
-                mj.importe = mi.importe
-                mi.importe = None
-
-    # 2) Shift hacia arriba (i -> i-1)
-    for i in range(2, len(movs)):
-        mi = movs[i]
-        mp = movs[i - 1]
-
-        if mi.importe is None or expected[i] is None or expected[i - 1] is None:
-            continue
-
-        ok_i = close(mi.importe, expected[i])
-        ok_prev = close(mi.importe, expected[i - 1])
-
-        if (not ok_i) and ok_prev:
-            if (mp.importe is None) or (expected[i - 1] is not None and not close(mp.importe, expected[i - 1])):
-                mp.importe = mi.importe
-                mi.importe = None
-
-    return movs
 
 def parse_ar_number(token: str) -> Optional[float]:
     """
@@ -141,7 +85,7 @@ def parse_ar_number(token: str) -> Optional[float]:
       - 1.648.32 (OCR: miles con puntos + decimal con punto)
       - -155.642.50 (OCR)
     """
-    t = token.strip()
+    t = token.strip().replace("$", "")
     if not t:
         return None
     if not re.fullmatch(r"[-+]?\d[\d\.,]*", t):
@@ -198,10 +142,19 @@ def parse_date(line: str) -> Optional[datetime]:
         return None
 
 
+def _looks_like_page_number_only(line: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,4}", line.strip()))
+
+
 def is_header_noise(line: str) -> bool:
+    """
+    Importante: NO filtrar por 'I.V.A.' a secas porque rompe líneas como:
+      'Percepción I.V.A. RG. ...'
+    """
     l = line.strip().upper()
     if not l:
         return True
+
     noisy = [
         "DETALLE DE MOVIMIENTOS",
         "RESUMEN DE CUENTA",
@@ -211,20 +164,15 @@ def is_header_noise(line: str) -> bool:
         "DEBITO CREDITO SALDO",
         "SUBTOTAL",
         "I.V.A. RESPONSABLE",
-        "I.V.A.",
+        "IVA RESPONSABLE",
+        "RESPONSABLE INSCRIPTO",
         "C.U.I.T",
-        "NRO COMERCIO",
-        "MARCA:",
         "CBU:",
         "BENEF:",
         "PÁGINA",
         "PAGINA",
     ]
     return any(x in l for x in noisy)
-
-
-def _looks_like_page_number_only(line: str) -> bool:
-    return bool(re.fullmatch(r"\d{1,4}", line.strip()))
 
 
 def _is_balance_only_line(line: str) -> Optional[float]:
@@ -235,7 +183,7 @@ def _is_balance_only_line(line: str) -> Optional[float]:
     s = line.strip().replace("$", "").strip()
     parts = s.split()
 
-    # Caso: "13 93,416.95" (contador de línea/página)
+    # Caso: "13 93,416.95" (contador de página/linea)
     if len(parts) == 2 and _looks_like_page_number_only(parts[0]) and MONEY_TOKEN_RE.fullmatch(parts[1]):
         s = parts[1]
 
@@ -332,7 +280,7 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
     # cola de pendientes (movimientos con importe pero sin saldo)
     pending: List[Movimiento] = []
 
-    # flag para evitar enganchar saldos de “arrastre” post header/subtotal
+    # flag para evitar enganchar saldos de arrastre post header/subtotal
     just_saw_header_or_subtotal = False
 
     def reset_current():
@@ -352,7 +300,6 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
 
         concepto = " ".join([p for p in cur_text_parts if p]).strip()
 
-        # si no hay nada útil, descartar
         if not (concepto or cur_importe is not None or cur_saldo is not None):
             reset_current()
             return
@@ -380,7 +327,7 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
 
         upper = line.upper()
 
-        # Detectar headers/subtotales para “no enganchar” el saldo arrastre inmediato
+        # Señales de header/subtotal para no “enganchar” un saldo arrastre
         if "DÉBITO" in upper and "CRÉDITO" in upper and "SALDO" in upper:
             just_saw_header_or_subtotal = True
             continue
@@ -391,34 +338,31 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
         if is_header_noise(line) or _looks_like_page_number_only(line):
             continue
 
-        # 1) Saldo-only line
+        # 1) Línea saldo-only
         bal = _is_balance_only_line(line)
         if bal is not None:
-            # Si venimos de header/subtotal y NO hay candidato claro, ignorar ese saldo “arrastre”
-            if just_saw_header_or_subtotal and (cur_fecha is None or cur_importe is None) and not pending:
+            # Si venimos de header/subtotal y no hay candidatos, ignorar saldo arrastre
+            has_current_candidate = (cur_fecha is not None and cur_importe is not None and cur_saldo is None)
+            if just_saw_header_or_subtotal and (not pending) and (not has_current_candidate):
                 just_saw_header_or_subtotal = False
                 continue
 
-            # Ya no estamos en zona header/subtotal
             just_saw_header_or_subtotal = False
 
-            # Prioridad A: movimiento actual abierto que tiene importe pero le falta saldo
-            if cur_fecha is not None and cur_importe is not None and cur_saldo is None:
-                cur_saldo = bal
-                flush_current_to_list_or_pending()
-            # Prioridad B: FIFO pending
-            elif pending:
+            # Regla clave: si hay pending, asignar FIFO primero
+            if pending:
                 pending[0].saldo = bal
                 movimientos.append(pending.pop(0))
+            elif has_current_candidate:
+                cur_saldo = bal
+                flush_current_to_list_or_pending()
             else:
-                # saldo suelto sin candidato => ignorar
+                # saldo suelto sin candidato: ignorar
                 pass
             continue
 
-        # Si no es saldo-only, ya no estamos justo después del subtotal/header
-        # (salvo que haya múltiples headers seguidos)
-        if not (upper.startswith("SUBTOTAL") or ("DÉBITO" in upper and "SALDO" in upper)):
-            just_saw_header_or_subtotal = False
+        # Ya no estamos en zona header/subtotal
+        just_saw_header_or_subtotal = False
 
         # 2) Nuevo movimiento si arranca con fecha
         dt = parse_date(line)
@@ -428,20 +372,27 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
             line = DATE_RE.sub("", line, count=1).strip()
             upper = line.upper()
 
-        # Si no hay movimiento activo, ignorar
         if cur_fecha is None:
             continue
 
-        # 3) Líneas metadata (no son movimiento)
-        if upper.startswith("OPERACIÓN") or upper.startswith("GENERADA EL"):
+        # 3) Metadata que no es movimiento
+        if (
+            upper.startswith("OPERACIÓN")
+            or upper.startswith("GENERADA EL")
+            or upper.startswith("IDENTIFICACION")
+            or upper.startswith("AFIP ID")
+        ):
             continue
+
+        # Nota: NO filtramos “Nro Comercio” / “Marca” como header_noise porque son líneas de contexto,
+        # pero SI querés excluirlas del concepto, saltealas acá:
         if upper.startswith("NRO COMERCIO") or upper.startswith("MARCA:"):
             continue
 
         # 4) Extraer cola numérica
         imp, sal, ref, rest = _extract_tail_money_and_ref(line)
 
-        # ref desde rest si quedó ahí
+        # ref dentro del texto restante (por si quedó)
         if cur_ref is None:
             mref = re.search(r"\b(\d{8,14})\b$", rest)
             if mref:
@@ -454,32 +405,89 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
         if rest:
             cur_text_parts.append(rest)
 
-        # ===== REGLA CLAVE (TU CASO IVA/Percepción/IIBB) =====
-        # Si la línea tiene FECHA (ya estamos dentro de movimiento) y aparece un SOLO money token,
-        # se interpreta como IMPORTE (y saldo vendrá suelto después).
         money_tokens = [t for t in line.split() if MONEY_TOKEN_RE.fullmatch(t)]
+
+        # Regla: si hay 1 solo money token en la línea, es IMPORTE (saldo vendrá “saldo-only” luego)
         if len(money_tokens) == 1:
             one_val = parse_ar_number(money_tokens[0])
             if one_val is not None:
                 cur_importe = one_val
-            # NO tocar cur_saldo
             continue
 
-        # Caso normal: si hay >=2 tokens money, el extractor ya devuelve imp/sal
+        # Caso normal: si hay >=2 money tokens (importe + saldo) o (importe + saldo en la misma línea)
         if imp is not None:
             cur_importe = imp
         if sal is not None:
             cur_saldo = sal
 
-        # NO flush acá: se cierra con nueva fecha, con saldo-only asignado o EOF
+        # NO flush acá: se cierra con nueva fecha, con saldo-only, o EOF
 
     flush_current_to_list_or_pending()
-
-    # pendientes sin saldo al final => salen con saldo None para auditoría
-    movimientos.extend(pending)
+    movimientos.extend(pending)  # pendientes sin saldo: salen para auditoría
 
     return movimientos
 
+
+# =========================================================
+# Reparación de corrimiento de importes
+# =========================================================
+def repair_shift_importes(movs: List[Movimiento], tol: float = 0.01) -> List[Movimiento]:
+    """
+    Repara desfasajes típicos OCR/TXT donde el importe quedó en la fila de arriba/abajo.
+    Regla:
+      - expected_i = abs(saldo_i - saldo_{i-1})
+      - si importe_i no coincide con expected_i pero coincide con expected_{i+1} => mover abajo
+      - si importe_i no coincide con expected_i pero coincide con expected_{i-1} => mover arriba
+    """
+    def close(a: Optional[float], b: Optional[float]) -> bool:
+        if a is None or b is None:
+            return False
+        return abs(abs(a) - abs(b)) <= max(tol, 0.01)
+
+    expected: List[Optional[float]] = [None] * len(movs)
+    prev_saldo: Optional[float] = None
+
+    for i, m in enumerate(movs):
+        if m.saldo is None:
+            expected[i] = None
+            continue
+        if prev_saldo is None:
+            expected[i] = None
+        else:
+            expected[i] = abs(m.saldo - prev_saldo)
+        prev_saldo = m.saldo
+
+    # Shift hacia abajo
+    for i in range(1, len(movs) - 1):
+        mi = movs[i]
+        mj = movs[i + 1]
+        if mi.importe is None or expected[i] is None or expected[i + 1] is None:
+            continue
+
+        ok_i = close(mi.importe, expected[i])
+        ok_next = close(mi.importe, expected[i + 1])
+
+        if (not ok_i) and ok_next:
+            if (mj.importe is None) or (expected[i + 1] is not None and not close(mj.importe, expected[i + 1])):
+                mj.importe = mi.importe
+                mi.importe = None
+
+    # Shift hacia arriba
+    for i in range(2, len(movs)):
+        mi = movs[i]
+        mp = movs[i - 1]
+        if mi.importe is None or expected[i] is None or expected[i - 1] is None:
+            continue
+
+        ok_i = close(mi.importe, expected[i])
+        ok_prev = close(mi.importe, expected[i - 1])
+
+        if (not ok_i) and ok_prev:
+            if (mp.importe is None) or (expected[i - 1] is not None and not close(mp.importe, expected[i - 1])):
+                mp.importe = mi.importe
+                mi.importe = None
+
+    return movs
 
 
 # =========================================================
@@ -498,7 +506,6 @@ def audit_and_classify(movs: List[Movimiento], tol: float = 0.01) -> List[Movimi
             continue
 
         if prev_saldo is None:
-            # primer registro: no auditable por delta
             m.delta_saldo = None
             if m.importe is None:
                 flags.append("PRIMERA_FILA_SIN_IMPORTE")
@@ -510,7 +517,7 @@ def audit_and_classify(movs: List[Movimiento], tol: float = 0.01) -> List[Movimi
         delta = m.saldo - prev_saldo
         m.delta_saldo = delta
 
-        # Clasificación por delta de saldo (regla principal)
+        # Clasificación por delta de saldo
         if abs(delta) <= tol:
             m.debito = 0.0
             m.credito = 0.0
@@ -522,7 +529,6 @@ def audit_and_classify(movs: List[Movimiento], tol: float = 0.01) -> List[Movimi
             m.debito = round(-delta, 2)
             m.credito = 0.0
 
-        # Importe: debe existir; si no, lo inferimos del delta
         if m.importe is None:
             m.importe_inferido = round(abs(delta), 2)
             flags.append("IMPORTE_INFERIDO_POR_SALDO")
@@ -530,13 +536,7 @@ def audit_and_classify(movs: List[Movimiento], tol: float = 0.01) -> List[Movimi
             if abs(abs(delta) - abs(m.importe)) > max(tol, 0.01):
                 flags.append("IMPORTE_NO_COINCIDE_CON_DELTA_SALDO")
 
-        # Regla: no deben quedar movimientos sin importe
-        if m.importe is None and m.importe_inferido is None:
-            flags.append("SIN_IMPORTE")
-            m.ok_auditoria = False
-        else:
-            m.ok_auditoria = ("IMPORTE_NO_COINCIDE_CON_DELTA_SALDO" not in flags)
-
+        m.ok_auditoria = ("IMPORTE_NO_COINCIDE_CON_DELTA_SALDO" not in flags)
         m.flags = ";".join(flags)
         prev_saldo = m.saldo
 
@@ -601,7 +601,7 @@ with st.sidebar:
     st.header("🧰 Cómo usar")
     st.markdown(
         """
-1) Hacés OCR al PDF (vos ya lo hacés).  
+1) Hacés OCR al PDF.  
 2) Abrís el PDF y copiás el texto.  
 3) Pegás en un `.txt`.  
 4) Subís el `.txt` acá.  
@@ -678,5 +678,3 @@ with c2:
 
         with st.expander("Ver auditoría / flags (primeros 300)"):
             st.dataframe(df_aud.head(300), use_container_width=True, hide_index=True)
-
-
