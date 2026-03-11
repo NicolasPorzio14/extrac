@@ -25,7 +25,6 @@ from typing import Optional, List, Tuple
 import pandas as pd
 import streamlit as st
 import pdfplumber
-import pdfplumber
 
 
 # =========================================================
@@ -127,19 +126,13 @@ with tab2:
     st.header("Banco Galicia - Procesamiento de PDF")
     st.caption("Subí el PDF del extracto de Banco Galicia para procesar los movimientos.")
 
-    with st.sidebar:
-        st.header("🧰 Cómo usar Galicia")
-        st.markdown(
-            """
-1) Subí el PDF del extracto de Banco Galicia.
-2) El sistema extrae automáticamente los movimientos.
-3) Revisa la vista previa y descargá el Excel.
-            """
-        )
-
-    c1, c2 = st.columns([1, 1.5], gap="large")
-
-    with c1:
+    st.markdown(
+        """
+    1) Subí el PDF del extracto de Banco Galicia.
+    2) El sistema extrae automáticamente los movimientos.
+    3) Revisa la vista previa y descargá el Excel.
+        """
+    )
         st.subheader("📥 Cargar PDF")
         uploaded_pdf = st.file_uploader("Archivo PDF", type=["pdf"])
         process_gal = st.button("PROCESAR PDF", type="primary", use_container_width=True, disabled=(uploaded_pdf is None))
