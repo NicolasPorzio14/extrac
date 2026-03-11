@@ -1,17 +1,10 @@
 # app.py
 # Streamlit ETL: TXT (copiado de PDF con OCR) -> Excel (Movimientos + Auditoría)
+#              + Banco Galicia: PDF nativo -> Excel
 #
 # Ejecutar:
-#   pip install streamlit pandas openpyxl
+#   pip install streamlit pandas openpyxl pdfplumber
 #   streamlit run app.py
-#
-# Qué hace:
-# - Subís un .txt con el contenido copiado del PDF (OCR ya hecho).
-# - Parseo robusto: fecha, concepto, referencia, importe, saldo.
-# - Maneja casos NO lineales típicos (conceptos en una línea + montos/saldos en líneas siguientes).
-# - Débito/Crédito se clasifica por delta de saldo (regla principal).
-# - Auditoría: compara delta vs importe y marca inconsistencias.
-# - Descargás un .xlsx con 2 hojas: Movimientos y Auditoría.
 
 from __future__ import annotations
 
@@ -24,164 +17,19 @@ from typing import Optional, List, Tuple
 
 import pandas as pd
 import streamlit as st
-import pdfplumber
 
 
 # =========================================================
 # Config UI
 # =========================================================
 st.set_page_config(page_title="ETL Extracto → Excel", page_icon="📄", layout="wide")
-st.title("📄 ETL Extracto bancario (TXT OCR) → Excel")
-st.caption("Subí el TXT copiado del PDF (OCR ya hecho). Genera Excel con auditoría lógica por SALDO.")
+st.title("📄 ETL Extracto bancario → Excel")
+st.caption("Procesá extractos bancarios y generá Excel con auditoría lógica.")
 
-tab1, tab2 = st.tabs(["Banco Actual", "Banco Galicia"])
 
-with tab1:
-    with st.sidebar:
-        st.header("🧰 Cómo usar")
-        st.markdown(
-            """
-1) Hacés OCR al PDF (vos ya lo hacés).  
-2) Abrís el PDF y copiás el texto.  
-3) Pegás en un `.txt`.  
-4) Subís el `.txt` acá.  
-5) Descargás el Excel.
-
-**Regla clave:** Débito/Crédito se clasifica por **delta de saldo**.
-            """
-        )
-        st.divider()
-        tol = st.number_input("Tolerancia auditoría (pesos)", min_value=0.0, value=0.01, step=0.01, format="%.2f")
-        apply_shift_fix = st.checkbox("Aplicar reparación de desfasaje de importes (arriba/abajo)", value=False)
-
-    c1, c2 = st.columns([1.05, 1.25], gap="large")
-
-    with c1:
-        st.subheader("📥 Cargar archivo")
-        uploaded = st.file_uploader("Archivo .txt", type=["txt"])
-        process = st.button("PROCESAR", type="primary", use_container_width=True, disabled=(uploaded is None))
-
-    with c2:
-        st.subheader("📊 Vista previa")
-
-        if "df_mov" not in st.session_state:
-            st.session_state.df_mov = None
-            st.session_state.df_aud = None
-            st.session_state.excel_bytes = None
-
-        if process and uploaded is not None:
-            txt = uploaded.getvalue().decode("utf-8", errors="ignore")
-
-            movs = parse_movimientos_from_txt_text(txt)
-
-            if apply_shift_fix:
-                movs = repair_shift_importes(movs, tol=float(tol))
-
-            movs = audit_and_classify(movs, tol=float(tol))
-
-            df_mov, df_aud = movimientos_to_dfs(movs)
-            excel_bytes = build_excel_bytes(df_mov, df_aud)
-
-            st.session_state.df_mov = df_mov
-            st.session_state.df_aud = df_aud
-            st.session_state.excel_bytes = excel_bytes
-
-        df_mov = st.session_state.df_mov
-        df_aud = st.session_state.df_aud
-        excel_bytes = st.session_state.excel_bytes
-
-        if df_mov is None or df_mov.empty:
-            st.info("Subí un TXT y tocá **PROCESAR** para ver la vista previa.")
-        else:
-            total = int(len(df_mov))
-            errores = int(len(df_aud)) if df_aud is not None else 0
-
-            saldo_inicial = df_mov["Saldo"].dropna().iloc[0] if df_mov["Saldo"].notna().any() else None
-            saldo_final = df_mov["Saldo"].dropna().iloc[-1] if df_mov["Saldo"].notna().any() else None
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total movimientos", f"{total}")
-            m2.metric("Saldo inicial", f"${saldo_inicial:,.2f}" if saldo_inicial is not None else "N/D")
-            m3.metric("Saldo final", f"${saldo_final:,.2f}" if saldo_final is not None else "N/D")
-            m4.metric("Observaciones", f"{errores}")
-
-            st.dataframe(
-                df_mov[["Fecha", "Concepto", "Importe_Final", "Débito", "Crédito", "Saldo", "Flags"]].head(80),
-                use_container_width=True,
-                hide_index=True
-            )
-
-            st.download_button(
-                label="⬇️ Descargar Excel",
-                data=excel_bytes,
-                file_name="Extracto_ETL.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
-            with st.expander("Ver auditoría / flags (primeros 400)"):
-                st.dataframe(df_aud.head(400), use_container_width=True, hide_index=True)
-
-with tab2:
-    st.header("Banco Galicia - Procesamiento de PDF")
-    st.caption("Subí el PDF del extracto de Banco Galicia para procesar los movimientos.")
-
-    st.markdown(
-        """
-    1) Subí el PDF del extracto de Banco Galicia.
-    2) El sistema extrae automáticamente los movimientos.
-    3) Revisa la vista previa y descargá el Excel.
-        """
-    )
-        st.subheader("📥 Cargar PDF")
-        uploaded_pdf = st.file_uploader("Archivo PDF", type=["pdf"])
-        process_gal = st.button("PROCESAR PDF", type="primary", use_container_width=True, disabled=(uploaded_pdf is None))
-
-    with c2:
-        st.subheader("📊 Vista previa")
-
-        if "df_gal" not in st.session_state:
-            st.session_state.df_gal = None
-            st.session_state.num_reg_gal = 0
-            st.session_state.excel_gal = None
-
-        if process_gal and uploaded_pdf is not None:
-            try:
-                pdf_bytes = uploaded_pdf.getvalue()
-                df_gal, num_reg, excel_gal = process_galicia(pdf_bytes)
-
-                st.session_state.df_gal = df_gal
-                st.session_state.num_reg_gal = num_reg
-                st.session_state.excel_gal = excel_gal
-
-                st.success(f"Procesamiento exitoso. Registros detectados: {num_reg}")
-            except Exception as e:
-                st.error(f"Error al procesar el PDF: {str(e)}")
-                st.session_state.df_gal = None
-                st.session_state.num_reg_gal = 0
-                st.session_state.excel_gal = None
-
-        df_gal = st.session_state.df_gal
-        num_reg_gal = st.session_state.num_reg_gal
-        excel_gal = st.session_state.excel_gal
-
-        if df_gal is None or df_gal.empty:
-            st.info("Subí un PDF y tocá **PROCESAR PDF** para ver la vista previa.")
-        else:
-            st.metric("Registros detectados", f"{num_reg_gal}")
-
-            st.dataframe(df_gal.head(50), use_container_width=True, hide_index=True)
-
-            pdf_name = uploaded_pdf.name
-            excel_name = f"etl_{pdf_name.replace('.pdf', '.xlsx')}"
-
-            st.download_button(
-                label="⬇️ Descargar Excel",
-                data=excel_gal,
-                file_name=excel_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
+# =========================================================
+# Regex / parsing helpers  (lógica original — sin cambios)
+# =========================================================
 DATE_RE = re.compile(r"^(?P<d>\d{2}/\d{2}/\d{2})\b")
 
 # Token monetario (termina en 2 decimales) + soporta OCR tipo 172.291.54
@@ -427,14 +275,14 @@ class Movimiento:
 
 
 # =========================================================
-# Parser principal (state machine)
+# Parser principal (state machine)  — sin cambios
 # =========================================================
 def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
     """
     Parser robusto:
-    - Soporta movimientos “partidos”: concepto en una línea y (ref/importe/saldo) en líneas siguientes.
+    - Soporta movimientos "partidos": concepto en una línea y (ref/importe/saldo) en líneas siguientes.
     - Soporta múltiples conceptos seguidos y luego múltiples líneas de importes/saldos.
-    - Evita crear “movimientos fantasma” con líneas descriptivas (ej. CAPTAIN HOPS SAS).
+    - Evita crear "movimientos fantasma" con líneas descriptivas (ej. CAPTAIN HOPS SAS).
     """
     raw_lines = [_clean_ocr_weird_chars(x.rstrip("\n")) for x in text.splitlines()]
 
@@ -443,7 +291,7 @@ def parse_movimientos_from_txt_text(text: str) -> List[Movimiento]:
     last_date: Optional[datetime] = None
     last_completed: Optional[Movimiento] = None
 
-    # para ignorar un saldo “arrastre” luego de SUBTOTAL / headers o de la palabra "Saldo"
+    # para ignorar un saldo "arrastre" luego de SUBTOTAL / headers o de la palabra "Saldo"
     ignore_next_balance_only = False
 
     for raw in raw_lines:
@@ -762,38 +610,32 @@ def build_excel_bytes(df_mov: pd.DataFrame, df_aud: pd.DataFrame) -> bytes:
 
 
 # =========================================================
-# Funciones para Banco Galicia
+# BANCO GALICIA — ETL (funciones nuevas, encapsuladas)
 # =========================================================
-def limpiar_texto(texto: str) -> str:
+
+def _galicia_limpiar_texto(texto: str) -> str:
     if texto is None:
         return ""
     texto = re.sub(r"\s+", " ", texto).strip()
     return texto
 
 
-def parse_numero_es(valor: str):
+def _galicia_parse_numero_es(valor: str):
     """
     Convierte números argentinos tipo:
-    1.500.000,00
-    451.815,41-
-    -38.000,00
-    a Decimal
+    1.500.000,00 / 451.815,41- / -38.000,00
+    a Decimal.
     """
     if valor is None:
         return None
-
     valor = valor.strip()
     if not valor:
         return None
 
     negativo = False
-
-    # Caso "451.815,41-"
     if valor.endswith("-"):
         negativo = True
         valor = valor[:-1].strip()
-
-    # Caso "-38.000,00"
     if valor.startswith("-"):
         negativo = True
         valor = valor[1:].strip()
@@ -809,15 +651,15 @@ def parse_numero_es(valor: str):
         return None
 
 
-def es_fecha(linea: str) -> bool:
+def _galicia_es_fecha(linea: str) -> bool:
     return bool(re.match(r"^\d{2}/\d{2}/\d{2}\b", linea.strip()))
 
 
-def es_linea_total(linea: str) -> bool:
+def _galicia_es_linea_total(linea: str) -> bool:
     return linea.strip().startswith("Total ")
 
 
-def es_linea_encabezado(linea: str) -> bool:
+def _galicia_es_linea_encabezado(linea: str) -> bool:
     encabezados = [
         "Fecha Descripción Origen Crédito Débito Saldo",
         "Fecha Descripción Crédito Débito Saldo",
@@ -828,10 +670,15 @@ def es_linea_encabezado(linea: str) -> bool:
     return any(h in linea for h in encabezados)
 
 
-def extraer_texto_pdf(pdf_bytes: bytes) -> list[str]:
-    lineas = []
+def _galicia_extraer_texto_pdf(pdf_file) -> list:
+    """Recibe un objeto file-like (BytesIO / UploadedFile) y devuelve líneas."""
+    try:
+        import pdfplumber
+    except ImportError:
+        raise ImportError("pdfplumber no está instalado. Ejecutá: pip install pdfplumber")
 
-    with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+    lineas = []
+    with pdfplumber.open(pdf_file) as pdf:
         for pagina in pdf.pages:
             texto = pagina.extract_text()
             if not texto:
@@ -840,14 +687,10 @@ def extraer_texto_pdf(pdf_bytes: bytes) -> list[str]:
                 linea = linea.rstrip()
                 if linea:
                     lineas.append(linea)
-
     return lineas
 
 
-def extraer_lineas_movimientos(lineas_pdf: list[str]) -> list[str]:
-    """
-    Toma solo las líneas de la sección de movimientos.
-    """
+def _galicia_extraer_lineas_movimientos(lineas_pdf: list) -> list:
     dentro_movimientos = False
     resultado = []
 
@@ -857,27 +700,21 @@ def extraer_lineas_movimientos(lineas_pdf: list[str]) -> list[str]:
             continue
 
         if dentro_movimientos:
-            # cortar cuando llega al total o consolidado
-            if es_linea_total(linea) or "Consolidado de retención de impuestos" in linea:
+            if _galicia_es_linea_total(linea) or "Consolidado de retención de impuestos" in linea:
                 break
-
-            if es_linea_encabezado(linea):
+            if _galicia_es_linea_encabezado(linea):
                 continue
-
             resultado.append(linea)
 
     return resultado
 
 
-def agrupar_registros(lineas_mov: list[str]) -> list[str]:
-    """
-    Une líneas partidas. Cada registro empieza cuando aparece una fecha.
-    """
+def _galicia_agrupar_registros(lineas_mov: list) -> list:
     registros = []
     actual = []
 
     for linea in lineas_mov:
-        if es_fecha(linea):
+        if _galicia_es_fecha(linea):
             if actual:
                 registros.append(" ".join(actual).strip())
             actual = [linea.strip()]
@@ -891,19 +728,7 @@ def agrupar_registros(lineas_mov: list[str]) -> list[str]:
     return registros
 
 
-def parsear_registro(registro: str):
-    """
-    Extrae:
-    FECHA, DESCRIPCION, CREDITO, DEBITO, SALDO
-
-    Lógica:
-    - toma la fecha al inicio
-    - al final del registro busca 1 o 2 importes:
-        * si hay 2 => (credito/debito, saldo)
-        * si hay 1 => sólo saldo, lo cual suele ser un caso problemático
-    - si el primer importe es negativo => débito
-    - si es positivo => crédito
-    """
+def _galicia_parsear_registro(registro: str):
     patron = r"^(\d{2}/\d{2}/\d{2})\s+(.*)$"
     m = re.match(patron, registro)
     if not m:
@@ -912,11 +737,9 @@ def parsear_registro(registro: str):
     fecha = m.group(1)
     resto = m.group(2).strip()
 
-    # buscar todos los importes con formato argentino
     numeros = re.findall(r"-?\d{1,3}(?:\.\d{3})*,\d{2}-?", resto)
 
     if len(numeros) < 2:
-        # Si no hay al menos movimiento y saldo, descartamos o marcamos para revisar
         return {
             "FECHA": fecha,
             "DESCRIPCION": resto,
@@ -925,14 +748,12 @@ def parsear_registro(registro: str):
             "SALDO": None
         }
 
-    # tomamos los últimos dos como: movimiento, saldo
     movimiento_str = numeros[-2]
     saldo_str = numeros[-1]
 
-    movimiento = parse_numero_es(movimiento_str)
-    saldo = parse_numero_es(saldo_str)
+    movimiento = _galicia_parse_numero_es(movimiento_str)
+    saldo = _galicia_parse_numero_es(saldo_str)
 
-    # recortamos la descripción quitando los dos últimos importes
     idx_mov = resto.rfind(movimiento_str)
     descripcion = resto[:idx_mov].strip()
 
@@ -947,21 +768,14 @@ def parsear_registro(registro: str):
 
     return {
         "FECHA": fecha,
-        "DESCRIPCION": limpiar_texto(descripcion),
+        "DESCRIPCION": _galicia_limpiar_texto(descripcion),
         "CREDITO": float(credito) if credito is not None else None,
         "DEBITO": float(debito) if debito is not None else None,
         "SALDO": float(saldo) if saldo is not None else None
     }
 
 
-def agregar_columnas_control(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Agrega:
-    - SALDO_ANTERIOR
-    - MOVIMIENTO
-    - SALDO_CALCULADO
-    - CONTROL_SALDO
-    """
+def _galicia_agregar_columnas_control(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     df["CREDITO"] = pd.to_numeric(df["CREDITO"], errors="coerce")
@@ -978,18 +792,16 @@ def agregar_columnas_control(df: pd.DataFrame) -> pd.DataFrame:
         return "VERDADERO" if round(row["SALDO_CALCULADO"], 2) == round(row["SALDO"], 2) else "FALSO"
 
     df["CONTROL_SALDO"] = df.apply(validar_fila, axis=1)
-
     return df
 
 
-def exportar_excel_galicia(df: pd.DataFrame) -> BytesIO:
+def _galicia_build_excel_bytes(df: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Movimientos")
 
         ws = writer.sheets["Movimientos"]
 
-        # ancho de columnas
         anchos = {
             "A": 12,   # FECHA
             "B": 70,   # DESCRIPCION
@@ -1001,142 +813,217 @@ def exportar_excel_galicia(df: pd.DataFrame) -> BytesIO:
             "H": 16,   # SALDO_CALCULADO
             "I": 16,   # CONTROL_SALDO
         }
-
         for col, ancho in anchos.items():
             ws.column_dimensions[col].width = ancho
 
-        # formato numérico
         for row in ws.iter_rows(min_row=2, min_col=3, max_col=8):
             for cell in row:
                 cell.number_format = '#,##0.00'
 
     output.seek(0)
-    return output
+    return output.read()
 
 
-def process_galicia(pdf_bytes: bytes):
+def _galicia_run_etl(pdf_file) -> pd.DataFrame:
     """
-    Procesa el PDF de Galicia y devuelve df, num_registros, excel_bytes
+    Orquesta todo el ETL de Galicia sobre un file-like object.
+    Devuelve el DataFrame final con columnas de control.
+    Lanza excepciones con mensajes descriptivos si algo falla.
     """
-    try:
-        lineas_pdf = extraer_texto_pdf(pdf_bytes)
-        if not lineas_pdf:
-            raise ValueError("El PDF no contiene texto extraíble.")
+    lineas_pdf = _galicia_extraer_texto_pdf(pdf_file)
+    if not lineas_pdf:
+        raise ValueError("El PDF no contiene texto extraíble. ¿Es un PDF escaneado (imagen)?")
 
-        lineas_mov = extraer_lineas_movimientos(lineas_pdf)
-        if not lineas_mov:
-            raise ValueError("No se encontró la sección de movimientos en el PDF.")
+    lineas_mov = _galicia_extraer_lineas_movimientos(lineas_pdf)
+    if not lineas_mov:
+        raise ValueError(
+            "No se encontró la sección de movimientos en el PDF. "
+            "Verificá que el archivo sea un extracto de Banco Galicia."
+        )
 
-        registros = agrupar_registros(lineas_mov)
+    registros = _galicia_agrupar_registros(lineas_mov)
+    if not registros:
+        raise ValueError("Se encontró la sección de movimientos pero no hay registros agrupables.")
 
-        data = []
-        for reg in registros:
-            fila = parsear_registro(reg)
-            if fila:
-                data.append(fila)
+    data = []
+    for reg in registros:
+        fila = _galicia_parsear_registro(reg)
+        if fila:
+            data.append(fila)
 
-        if not data:
-            raise ValueError("No se detectaron registros válidos en el PDF.")
+    if not data:
+        raise ValueError("No se pudieron parsear registros válidos del extracto.")
 
-        df = pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    df = df[df["SALDO"].notna()].reset_index(drop=True)
 
-        # quitar filas sin saldo si querés dejar solo movimientos bien parseados
-        df = df[df["SALDO"].notna()].reset_index(drop=True)
+    if df.empty:
+        raise ValueError(
+            "Se detectaron registros pero ninguno tiene saldo válido. "
+            "El formato del PDF puede no coincidir con el esperado."
+        )
 
-        df = agregar_columnas_control(df)
-
-        excel_bytes = exportar_excel_galicia(df)
-
-        return df, len(df), excel_bytes
-    except Exception as e:
-        raise e
+    df = _galicia_agregar_columnas_control(df)
+    return df
 
 
 # =========================================================
-# UI
+# UI — Pestañas
 # =========================================================
-with st.sidebar:
-    st.header("🧰 Cómo usar")
-    st.markdown(
-        """
-1) Hacés OCR al PDF (vos ya lo hacés).  
-2) Abrís el PDF y copiás el texto.  
-3) Pegás en un `.txt`.  
-4) Subís el `.txt` acá.  
-5) Descargás el Excel.
+tab_ocr, tab_galicia = st.tabs(["📋 Extracto TXT (OCR)", "🏦 Banco Galicia"])
 
-**Regla clave:** Débito/Crédito se clasifica por **delta de saldo**.
-        """
+
+# ----------------------------------------------------------
+# Pestaña 1: lógica original (sin cambios)
+# ----------------------------------------------------------
+with tab_ocr:
+    st.caption("Subí el TXT copiado del PDF (OCR ya hecho). Genera Excel con auditoría lógica por SALDO.")
+
+    with st.sidebar:
+        st.header("🧰 Cómo usar")
+        st.markdown(
+            """
+    1) Hacés OCR al PDF (vos ya lo hacés).  
+    2) Abrís el PDF y copiás el texto.  
+    3) Pegás en un `.txt`.  
+    4) Subís el `.txt` acá.  
+    5) Descargás el Excel.
+
+    **Regla clave:** Débito/Crédito se clasifica por **delta de saldo**.
+            """
+        )
+        st.divider()
+        tol = st.number_input("Tolerancia auditoría (pesos)", min_value=0.0, value=0.01, step=0.01, format="%.2f")
+        apply_shift_fix = st.checkbox("Aplicar reparación de desfasaje de importes (arriba/abajo)", value=False)
+
+    c1, c2 = st.columns([1.05, 1.25], gap="large")
+
+    with c1:
+        st.subheader("📥 Cargar archivo")
+        uploaded = st.file_uploader("Archivo .txt", type=["txt"], key="uploader_ocr")
+        process = st.button("PROCESAR", type="primary", use_container_width=True, disabled=(uploaded is None), key="btn_ocr")
+
+    with c2:
+        st.subheader("📊 Vista previa")
+
+        if "df_mov" not in st.session_state:
+            st.session_state.df_mov = None
+            st.session_state.df_aud = None
+            st.session_state.excel_bytes = None
+
+        if process and uploaded is not None:
+            txt = uploaded.getvalue().decode("utf-8", errors="ignore")
+
+            movs = parse_movimientos_from_txt_text(txt)
+
+            if apply_shift_fix:
+                movs = repair_shift_importes(movs, tol=float(tol))
+
+            movs = audit_and_classify(movs, tol=float(tol))
+
+            df_mov, df_aud = movimientos_to_dfs(movs)
+            excel_bytes = build_excel_bytes(df_mov, df_aud)
+
+            st.session_state.df_mov = df_mov
+            st.session_state.df_aud = df_aud
+            st.session_state.excel_bytes = excel_bytes
+
+        df_mov = st.session_state.df_mov
+        df_aud = st.session_state.df_aud
+        excel_bytes = st.session_state.excel_bytes
+
+        if df_mov is None or df_mov.empty:
+            st.info("Subí un TXT y tocá **PROCESAR** para ver la vista previa.")
+        else:
+            total = int(len(df_mov))
+            errores = int(len(df_aud)) if df_aud is not None else 0
+
+            saldo_inicial = df_mov["Saldo"].dropna().iloc[0] if df_mov["Saldo"].notna().any() else None
+            saldo_final = df_mov["Saldo"].dropna().iloc[-1] if df_mov["Saldo"].notna().any() else None
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total movimientos", f"{total}")
+            m2.metric("Saldo inicial", f"${saldo_inicial:,.2f}" if saldo_inicial is not None else "N/D")
+            m3.metric("Saldo final", f"${saldo_final:,.2f}" if saldo_final is not None else "N/D")
+            m4.metric("Observaciones", f"{errores}")
+
+            st.dataframe(
+                df_mov[["Fecha", "Concepto", "Importe_Final", "Débito", "Crédito", "Saldo", "Flags"]].head(80),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.download_button(
+                label="⬇️ Descargar Excel",
+                data=excel_bytes,
+                file_name="Extracto_ETL.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="download_ocr",
+            )
+
+            with st.expander("Ver auditoría / flags (primeros 400)"):
+                st.dataframe(df_aud.head(400), use_container_width=True, hide_index=True)
+
+
+# ----------------------------------------------------------
+# Pestaña 2: Banco Galicia (nueva)
+# ----------------------------------------------------------
+with tab_galicia:
+    st.subheader("🏦 ETL Extracto Banco Galicia (PDF nativo)")
+    st.caption(
+        "Subí el PDF del extracto de Banco Galicia. "
+        "El sistema extrae los movimientos y genera un Excel con columnas de control de saldo."
     )
-    st.divider()
-    tol = st.number_input("Tolerancia auditoría (pesos)", min_value=0.0, value=0.01, step=0.01, format="%.2f")
-    apply_shift_fix = st.checkbox("Aplicar reparación de desfasaje de importes (arriba/abajo)", value=False)
 
+    pdf_galicia = st.file_uploader(
+        "Seleccioná el PDF del extracto Galicia",
+        type=["pdf"],
+        key="uploader_galicia",
+    )
 
-c1, c2 = st.columns([1.05, 1.25], gap="large")
-
-with c1:
-    st.subheader("📥 Cargar archivo")
-    uploaded = st.file_uploader("Archivo .txt", type=["txt"])
-    process = st.button("PROCESAR", type="primary", use_container_width=True, disabled=(uploaded is None))
-
-with c2:
-    st.subheader("📊 Vista previa")
-
-    if "df_mov" not in st.session_state:
-        st.session_state.df_mov = None
-        st.session_state.df_aud = None
-        st.session_state.excel_bytes = None
-
-    if process and uploaded is not None:
-        txt = uploaded.getvalue().decode("utf-8", errors="ignore")
-
-        movs = parse_movimientos_from_txt_text(txt)
-
-        if apply_shift_fix:
-            movs = repair_shift_importes(movs, tol=float(tol))
-
-        movs = audit_and_classify(movs, tol=float(tol))
-
-        df_mov, df_aud = movimientos_to_dfs(movs)
-        excel_bytes = build_excel_bytes(df_mov, df_aud)
-
-        st.session_state.df_mov = df_mov
-        st.session_state.df_aud = df_aud
-        st.session_state.excel_bytes = excel_bytes
-
-    df_mov = st.session_state.df_mov
-    df_aud = st.session_state.df_aud
-    excel_bytes = st.session_state.excel_bytes
-
-    if df_mov is None or df_mov.empty:
-        st.info("Subí un TXT y tocá **PROCESAR** para ver la vista previa.")
+    if pdf_galicia is None:
+        st.info("📂 Subí un PDF para comenzar el procesamiento.")
     else:
-        total = int(len(df_mov))
-        errores = int(len(df_aud)) if df_aud is not None else 0
+        if st.button("▶️ Procesar extracto Galicia", type="primary", key="btn_galicia"):
+            with st.spinner("Procesando PDF..."):
+                try:
+                    df_galicia = _galicia_run_etl(pdf_galicia)
 
-        saldo_inicial = df_mov["Saldo"].dropna().iloc[0] if df_mov["Saldo"].notna().any() else None
-        saldo_final = df_mov["Saldo"].dropna().iloc[-1] if df_mov["Saldo"].notna().any() else None
+                    # Métricas rápidas
+                    total_g = len(df_galicia)
+                    saldo_ini_g = df_galicia["SALDO"].dropna().iloc[0] if df_galicia["SALDO"].notna().any() else None
+                    saldo_fin_g = df_galicia["SALDO"].dropna().iloc[-1] if df_galicia["SALDO"].notna().any() else None
+                    errores_g = int((df_galicia["CONTROL_SALDO"] == "FALSO").sum())
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total movimientos", f"{total}")
-        m2.metric("Saldo inicial", f"${saldo_inicial:,.2f}" if saldo_inicial is not None else "N/D")
-        m3.metric("Saldo final", f"${saldo_final:,.2f}" if saldo_final is not None else "N/D")
-        m4.metric("Observaciones", f"{errores}")
+                    st.success(f"✅ Procesamiento exitoso — {total_g} movimientos detectados.")
 
-        st.dataframe(
-            df_mov[["Fecha", "Concepto", "Importe_Final", "Débito", "Crédito", "Saldo", "Flags"]].head(80),
-            use_container_width=True,
-            hide_index=True
-        )
+                    g1, g2, g3, g4 = st.columns(4)
+                    g1.metric("Movimientos", total_g)
+                    g2.metric("Saldo inicial", f"${saldo_ini_g:,.2f}" if saldo_ini_g is not None else "N/D")
+                    g3.metric("Saldo final", f"${saldo_fin_g:,.2f}" if saldo_fin_g is not None else "N/D")
+                    g4.metric("Control FALSO", errores_g)
 
-        st.download_button(
-            label="⬇️ Descargar Excel",
-            data=excel_bytes,
-            file_name="Extracto_ETL.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+                    st.dataframe(df_galicia, use_container_width=True, hide_index=True)
 
-        with st.expander("Ver auditoría / flags (primeros 400)"):
-            st.dataframe(df_aud.head(400), use_container_width=True, hide_index=True)
+                    # Nombre del Excel derivado del nombre del PDF
+                    nombre_base = pdf_galicia.name.rsplit(".", 1)[0]
+                    nombre_excel = f"etl_{nombre_base}.xlsx"
+
+                    excel_galicia = _galicia_build_excel_bytes(df_galicia)
+
+                    st.download_button(
+                        label="⬇️ Descargar Excel Galicia",
+                        data=excel_galicia,
+                        file_name=nombre_excel,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="download_galicia",
+                    )
+
+                except ImportError as e:
+                    st.error(f"❌ Dependencia faltante: {e}")
+                except ValueError as e:
+                    st.warning(f"⚠️ {e}")
+                except Exception as e:
+                    st.error(f"❌ Error inesperado al procesar el PDF: {e}")
