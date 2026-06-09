@@ -1,9 +1,10 @@
 # app.py
 # Streamlit ETL: TXT (copiado de PDF con OCR) -> Excel (Movimientos + Auditoría)
 #              + Banco Galicia: PDF nativo -> Excel
+#              + Mercado Pago: PDF nativo -> Excel
 #
 # Ejecutar:
-#   pip install streamlit pandas openpyxl pdfplumber
+#   pip install streamlit pandas openpyxl pdfplumber pypdf
 #   streamlit run app.py
 
 from __future__ import annotations
@@ -610,7 +611,7 @@ def build_excel_bytes(df_mov: pd.DataFrame, df_aud: pd.DataFrame) -> bytes:
 
 
 # =========================================================
-# BANCO GALICIA — ETL (funciones nuevas, encapsuladas)
+# BANCO GALICIA — ETL (funciones encapsuladas)
 # =========================================================
 
 def _galicia_limpiar_texto(texto: str) -> str:
@@ -868,9 +869,198 @@ def _galicia_run_etl(pdf_file) -> pd.DataFrame:
 
 
 # =========================================================
+# MERCADO PAGO — ETL (funciones nuevas, encapsuladas)
+# =========================================================
+
+def _mp_limpiar_monto(texto: str) -> float:
+    if not texto:
+        return 0.0
+    # Quitamos $, espacios, puntos de miles y normalizamos coma decimal
+    limpio = texto.replace("$", "").replace(" ", "").replace(".", "").replace(",", ".")
+    try:
+        return float(limpio)
+    except ValueError:
+        return 0.0
+
+
+def _mp_es_encabezado_o_basura(linea: str) -> bool:
+    """Detecta líneas que se repiten en saltos de página y no son movimientos."""
+    basura = [
+        r"^\d+/\d+$",                 # Números de página "1/5"
+        r"^DETALLE DE MOVIMIENTOS",
+        r"^Fecha\s+Descripción",      # Encabezados de columna
+        r"^RESUMEN DE CUENTA",
+        r"^Periodo:",
+        r"^Saldo inicial:",
+        r"^Entradas:",
+        r"^Salidas:",
+        r"^Saldo final:",
+    ]
+    for patron in basura:
+        if re.search(patron, linea, re.IGNORECASE):
+            return True
+    return False
+
+
+def _mp_extraer_lineas_pdf(pdf_file) -> list:
+    """Extrae líneas limpias del PDF de Mercado Pago usando pypdf."""
+    try:
+        import pypdf
+    except ImportError:
+        raise ImportError("pypdf no está instalado. Ejecutá: pip install pypdf")
+
+    reader = pypdf.PdfReader(pdf_file)
+
+    lineas_limpias = []
+    for page in reader.pages:
+        texto = page.extract_text()
+        if not texto:
+            continue
+        for linea in texto.split("\n"):
+            l = linea.strip()
+            if l and not _mp_es_encabezado_o_basura(l):
+                lineas_limpias.append(l)
+
+    return lineas_limpias
+
+
+def _mp_parsear_movimientos(lineas_limpias: list) -> list:
+    """
+    Reconstruye movimientos a partir de líneas (pueden venir partidas).
+    Un movimiento está completo cuando el buffer acumula al menos
+    dos símbolos '$' (Valor y Saldo).
+    """
+    movimientos = []
+    buffer = ""
+
+    for linea in lineas_limpias:
+        # Si la línea empieza con fecha, es un posible inicio de movimiento
+        if re.match(r"^\d{2}-\d{2}-\d{4}", linea):
+            buffer = linea
+        else:
+            # Si no empieza con fecha, es continuación del movimiento anterior
+            buffer += " " + linea
+
+        # Un movimiento está completo SOLO cuando tiene al menos dos símbolos '$'
+        if buffer.count("$") >= 2:
+            bloque = buffer
+            match_dinero = re.findall(r"\$\s?(-?[\d\.,\s]+)", bloque)
+
+            if len(match_dinero) >= 2:
+                saldo_str = match_dinero[-1]
+                valor_str = match_dinero[-2]
+
+                # Todo lo que está entre la fecha y el primer símbolo $ es Desc + ID
+                fecha = bloque[:10]
+                parte_central = bloque[10:bloque.find("$")].strip()
+
+                palabras = parte_central.split()
+                if palabras and palabras[-1].isdigit() and len(palabras[-1]) > 7:
+                    id_op = palabras[-1]
+                    desc = " ".join(palabras[:-1])
+                else:
+                    id_op = "N/A"
+                    desc = parte_central
+
+                movimientos.append({
+                    "Fecha": fecha,
+                    "Descripción": desc,
+                    "ID Operación": id_op,
+                    "Valor": _mp_limpiar_monto(valor_str),
+                    "Saldo Reportado": _mp_limpiar_monto(saldo_str),
+                })
+                buffer = ""  # Vaciamos el buffer porque ya procesamos este bloque
+
+    return movimientos
+
+
+def _mp_auditar(df: pd.DataFrame) -> pd.DataFrame:
+    """Recalcula saldos fila a fila y marca OK / ERROR."""
+    df = df.copy()
+    df["Saldo Calculado"] = 0.0
+    df["Diferencia"] = 0.0
+    df["Auditoría"] = ""
+
+    for i in range(len(df)):
+        if i == 0:
+            df.loc[i, "Saldo Calculado"] = df.loc[i, "Saldo Reportado"]
+            df.loc[i, "Auditoría"] = "INICIO"
+        else:
+            ant = df.loc[i - 1, "Saldo Reportado"]
+            mov = df.loc[i, "Valor"]
+            calc = round(ant + mov, 2)
+            rep = round(df.loc[i, "Saldo Reportado"], 2)
+            diff = round(abs(calc - rep), 2)
+
+            df.loc[i, "Saldo Calculado"] = calc
+            df.loc[i, "Diferencia"] = diff
+            df.loc[i, "Auditoría"] = "OK" if diff < 0.01 else "ERROR"
+
+    return df
+
+
+def _mp_build_excel_bytes(df: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Movimientos")
+
+        # Hoja de auditoría con las filas observadas (ERROR)
+        df_err = df[df["Auditoría"] == "ERROR"]
+        df_err.to_excel(writer, index=False, sheet_name="Auditoría")
+
+        for sheet_name in ["Movimientos", "Auditoría"]:
+            ws = writer.book[sheet_name]
+            ws.freeze_panes = "A2"
+
+            anchos = {
+                "A": 12,   # Fecha
+                "B": 55,   # Descripción
+                "C": 16,   # ID Operación
+                "D": 14,   # Valor
+                "E": 16,   # Saldo Reportado
+                "F": 16,   # Saldo Calculado
+                "G": 12,   # Diferencia
+                "H": 12,   # Auditoría
+            }
+            for col, ancho in anchos.items():
+                ws.column_dimensions[col].width = ancho
+
+            for row in ws.iter_rows(min_row=2, min_col=4, max_col=7):
+                for cell in row:
+                    cell.number_format = '#,##0.00'
+
+    output.seek(0)
+    return output.read()
+
+
+def _mp_run_etl(pdf_file) -> pd.DataFrame:
+    """
+    Orquesta el ETL completo de Mercado Pago sobre un file-like object.
+    Devuelve el DataFrame final con auditoría de saldos.
+    Lanza excepciones con mensajes descriptivos si algo falla.
+    """
+    lineas = _mp_extraer_lineas_pdf(pdf_file)
+    if not lineas:
+        raise ValueError("El PDF no contiene texto extraíble. ¿Es un PDF escaneado (imagen)?")
+
+    movimientos = _mp_parsear_movimientos(lineas)
+    if not movimientos:
+        raise ValueError(
+            "No se detectaron movimientos en el PDF. "
+            "Verificá que el archivo sea un resumen de cuenta de Mercado Pago."
+        )
+
+    df = pd.DataFrame(movimientos)
+    df = _mp_auditar(df)
+    return df
+
+
+# =========================================================
 # UI — Pestañas
 # =========================================================
-tab_ocr, tab_galicia = st.tabs(["📋 Extracto TXT (OCR)", "🏦 Banco Galicia"])
+tab_ocr, tab_galicia, tab_mp = st.tabs(
+    ["📋 Extracto TXT (OCR)", "🏦 Banco Galicia", "💳 Mercado Pago"]
+)
 
 
 # ----------------------------------------------------------
@@ -967,7 +1157,7 @@ with tab_ocr:
 
 
 # ----------------------------------------------------------
-# Pestaña 2: Banco Galicia (nueva)
+# Pestaña 2: Banco Galicia
 # ----------------------------------------------------------
 with tab_galicia:
     st.subheader("🏦 ETL Extracto Banco Galicia (PDF nativo)")
@@ -1019,6 +1209,78 @@ with tab_galicia:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                         key="download_galicia",
+                    )
+
+                except ImportError as e:
+                    st.error(f"❌ Dependencia faltante: {e}")
+                except ValueError as e:
+                    st.warning(f"⚠️ {e}")
+                except Exception as e:
+                    st.error(f"❌ Error inesperado al procesar el PDF: {e}")
+
+
+# ----------------------------------------------------------
+# Pestaña 3: Mercado Pago (nueva)
+# ----------------------------------------------------------
+with tab_mp:
+    st.subheader("💳 ETL Resumen Mercado Pago (PDF nativo)")
+    st.caption(
+        "Subí el PDF del resumen de cuenta de Mercado Pago. "
+        "El sistema extrae los movimientos, recalcula el saldo fila a fila "
+        "y genera un Excel con auditoría (OK / ERROR)."
+    )
+
+    pdf_mp = st.file_uploader(
+        "Seleccioná el PDF del resumen de Mercado Pago",
+        type=["pdf"],
+        key="uploader_mp",
+    )
+
+    if pdf_mp is None:
+        st.info("📂 Subí un PDF para comenzar el procesamiento.")
+    else:
+        if st.button("▶️ Procesar resumen Mercado Pago", type="primary", key="btn_mp"):
+            with st.spinner("Procesando PDF..."):
+                try:
+                    df_mp = _mp_run_etl(pdf_mp)
+
+                    # Métricas rápidas
+                    total_mp = len(df_mp)
+                    saldo_ini_mp = df_mp["Saldo Reportado"].dropna().iloc[0] if df_mp["Saldo Reportado"].notna().any() else None
+                    saldo_fin_mp = df_mp["Saldo Reportado"].dropna().iloc[-1] if df_mp["Saldo Reportado"].notna().any() else None
+                    errores_mp = int((df_mp["Auditoría"] == "ERROR").sum())
+
+                    st.success(f"✅ Procesamiento exitoso — {total_mp} movimientos detectados.")
+
+                    p1, p2, p3, p4 = st.columns(4)
+                    p1.metric("Movimientos", total_mp)
+                    p2.metric("Saldo inicial", f"${saldo_ini_mp:,.2f}" if saldo_ini_mp is not None else "N/D")
+                    p3.metric("Saldo final", f"${saldo_fin_mp:,.2f}" if saldo_fin_mp is not None else "N/D")
+                    p4.metric("Auditoría ERROR", errores_mp)
+
+                    st.dataframe(df_mp, use_container_width=True, hide_index=True)
+
+                    if errores_mp > 0:
+                        with st.expander(f"⚠️ Ver {errores_mp} filas con ERROR de auditoría"):
+                            st.dataframe(
+                                df_mp[df_mp["Auditoría"] == "ERROR"],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                    # Nombre del Excel derivado del nombre del PDF
+                    nombre_base_mp = pdf_mp.name.rsplit(".", 1)[0]
+                    nombre_excel_mp = f"etl_mp_{nombre_base_mp}.xlsx"
+
+                    excel_mp = _mp_build_excel_bytes(df_mp)
+
+                    st.download_button(
+                        label="⬇️ Descargar Excel Mercado Pago",
+                        data=excel_mp,
+                        file_name=nombre_excel_mp,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="download_mp",
                     )
 
                 except ImportError as e:
